@@ -9,7 +9,6 @@ from datetime import datetime
 from sqlalchemy import (
     Boolean,
     CheckConstraint,
-    DateTime,
     Float,
     ForeignKey,
     Index,
@@ -22,6 +21,9 @@ from sqlalchemy import (
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 from app.core.clock import utcnow
+from app.persistence.temporal import UTCDateTime as DateTime  # Correção de Datetimes v1.0:
+# mesmo tipo de coluna no SQLite (sem migration), mas garante leitura/gravação
+# sempre UTC-aware -- ver app/persistence/temporal.py.
 
 
 class Base(DeclarativeBase):

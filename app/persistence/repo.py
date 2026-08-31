@@ -5,7 +5,7 @@ enough that a query-builder layer would be premature.
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
+from datetime import datetime
 
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
@@ -156,11 +156,7 @@ def get_last_candle_open_time(session: Session, symbol: str, timeframe: str) -> 
     ).scalar_one_or_none()
     if row is None:
         return None
-    # SQLite's DATETIME column round-trips as a naive datetime regardless of
-    # what was stored -- every timestamp in this app is UTC by convention
-    # (app.core.clock.utcnow()), so re-attach that explicitly rather than
-    # ever comparing naive vs. aware datetimes.
-    return row if row.tzinfo is not None else row.replace(tzinfo=timezone.utc)
+    return row
 
 
 def save_signal(session: Session, symbol: str, direction: str, justification: str,
@@ -347,7 +343,7 @@ def last_funding_occurred_at(session: Session, symbol: str) -> datetime | None:
     ).scalar_one_or_none()
     if row is None:
         return None
-    return row if row.tzinfo is not None else row.replace(tzinfo=timezone.utc)
+    return row
 
 
 def funding_total(session: Session, symbol: str | None = None) -> float:
@@ -369,10 +365,6 @@ def get_funding_checkpoint(session: Session, symbol: str) -> FundingCollectionCh
     row = session.execute(
         select(FundingCollectionCheckpoint).where(FundingCollectionCheckpoint.symbol == symbol)
     ).scalar_one_or_none()
-    if row is None:
-        return None
-    if row.covered_until.tzinfo is None:
-        row.covered_until = row.covered_until.replace(tzinfo=timezone.utc)
     return row
 
 
@@ -391,10 +383,7 @@ def advance_funding_checkpoint(session: Session, symbol: str, covered_until: dat
         existing = FundingCollectionCheckpoint(symbol=symbol, covered_until=covered_until)
         session.add(existing)
     else:
-        current = existing.covered_until
-        if current.tzinfo is None:
-            current = current.replace(tzinfo=timezone.utc)
-        if covered_until > current:
+        if covered_until > existing.covered_until:
             existing.covered_until = covered_until
     session.flush()
     return existing

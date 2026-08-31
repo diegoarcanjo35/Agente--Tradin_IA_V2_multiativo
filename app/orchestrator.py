@@ -51,14 +51,6 @@ def _today_start_utc(now: datetime) -> datetime:
     return datetime.combine(now.date(), time.min, tzinfo=timezone.utc)
 
 
-def _reattach_utc(value: datetime | None) -> datetime | None:
-    """SQLite round-trips DateTime(timezone=True) as naive regardless of
-    what was stored -- never compare naive vs. aware."""
-    if value is not None and value.tzinfo is None:
-        return value.replace(tzinfo=timezone.utc)
-    return value
-
-
 class Orchestrator:
     def __init__(
         self,
@@ -117,7 +109,10 @@ class Orchestrator:
             # runs one real reconciliation at startup before the first tick
             # in production; this only matters for tests that build an
             # Orchestrator directly without that startup call.
-            last_reconciliation_at = _reattach_utc(state.last_reconciliation_at)
+            # Correção de Datetimes v1.0: state.last_reconciliation_at (e todo
+            # timestamp de domínio) já vem UTC-aware da camada ORM -- ver
+            # app/persistence/temporal.py::UTCDateTime.
+            last_reconciliation_at = state.last_reconciliation_at
 
             if last_reconciliation_at is not None:
                 elapsed = (utcnow() - last_reconciliation_at).total_seconds()
@@ -642,7 +637,7 @@ class Orchestrator:
 
         checkpoint = repo.get_funding_checkpoint(session, self.settings.symbol)
         window_start = (
-            _reattach_utc(checkpoint.covered_until) if checkpoint is not None
+            checkpoint.covered_until if checkpoint is not None
             else (now - timedelta(seconds=FUNDING_WINDOW_SECONDS))
         )
 
@@ -684,7 +679,7 @@ class Orchestrator:
         policy = self.settings.partial_fill_policy
         if policy == "WAIT":
             return
-        stalled_for = (now - _reattach_utc(order.updated_at)).total_seconds()
+        stalled_for = (now - order.updated_at).total_seconds()
         if stalled_for <= self.settings.partial_fill_timeout_seconds:
             return
 
