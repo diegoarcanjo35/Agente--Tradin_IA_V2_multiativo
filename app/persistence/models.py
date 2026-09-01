@@ -60,6 +60,13 @@ class StrategySignal(Base):
     atr: Mapped[float] = mapped_column(Float)
     params_json: Mapped[str] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    # Fase 3.1 (correção final auditoria PO): identidade determinística do
+    # candle que gerou este sinal -- SEMPRE `candle.open_time`, nunca
+    # derivado de preço ou de `created_at`. Nullable para compatibilidade
+    # com sinais legados (nunca inventar este valor para dados antigos).
+    source_candle_open_time: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
 
 class AIRecommendation(Base):

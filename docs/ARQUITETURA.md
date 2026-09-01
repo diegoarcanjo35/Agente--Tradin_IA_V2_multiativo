@@ -194,3 +194,11 @@ símbolo pode gerar cooldown que bloqueia entradas em todos. A sessão
 operacional (`docs/SESSOES_OPERACIONAIS.md`) passa a ser **uma única sessão
 de portfólio**, identificada por `(mode, símbolos ordenados, timeframe,
 estratégia, limites de risco)` — nunca uma sessão por símbolo.
+
+## Painel gráfico (Fase 3.1)
+
+Ver `docs/PAINEL_GRAFICO.md` para o desenho completo: rota somente-leitura
+`GET /api/chart-data`, preço visual (candle em formação) vs. candle
+fechado, TradingView Lightweight Charts vendorizado localmente (ver
+`THIRD_PARTY_NOTICES.md`), e isolamento multiativo do gráfico (troca de
+símbolo nunca mistura estado).

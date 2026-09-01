@@ -73,6 +73,14 @@ Schema history:
             previously stopped two OPEN rows for the same symbol at the
             database level). See docs/MIGRACOES.md and
             docs/ARQUITETURA.md ("Multiativo").
+  v7 -> v8  (Fase 3.1, correção final auditoria PO): adds
+            strategy_signals.source_candle_open_time (nullable DATETIME) --
+            the deterministic identity of the real candle (candle.open_time)
+            that produced a signal, used by the chart panel to place BUY/SELL
+            markers. Never derived from price or from created_at. Legacy
+            rows keep it NULL forever and are never backfilled/rewritten --
+            the API omits the marker for such signals rather than inventing
+            an association. See docs/PAINEL_GRAFICO.md.
 """
 from __future__ import annotations
 
@@ -85,7 +93,7 @@ from sqlalchemy.engine import Connection, Engine
 
 from app.persistence.models import Base
 
-CURRENT_SCHEMA_VERSION = 7
+CURRENT_SCHEMA_VERSION = 8
 
 
 class MigrationError(Exception):
@@ -560,6 +568,19 @@ def _migrate_to_v7(conn: Connection) -> None:
         ))
 
 
+def _migrate_to_v8(conn: Connection) -> None:
+    """Fase 3.1 (correção final auditoria PO): adiciona
+    strategy_signals.source_candle_open_time -- coluna nullable, simples
+    ALTER TABLE ADD COLUMN (sem rebuild, pois não há constraint NOT NULL/
+    CHECK envolvida). Nunca preenchida retroativamente para linhas legadas
+    -- fica NULL para sempre nesses casos, exatamente como a coluna
+    `symbols` de v7."""
+    if not _column_exists(conn, "strategy_signals", "source_candle_open_time"):
+        conn.execute(text(
+            "ALTER TABLE strategy_signals ADD COLUMN source_candle_open_time DATETIME"
+        ))
+
+
 # Order matters: applied strictly in ascending version order.
 MIGRATIONS: list[tuple[int, str, Callable[[Connection], None]]] = [
     (1, "Adiciona system_state.state_ambiguous, orders.is_close; relaxa orders.stop_loss para opcional.", _migrate_to_v1),
@@ -584,6 +605,10 @@ MIGRATIONS: list[tuple[int, str, Callable[[Connection], None]]] = [
         "retroativo em linhas legadas) e índice único parcial em positions(symbol) WHERE status='OPEN' -- "
         "fundação da Fase 3 multiativo.",
      _migrate_to_v7),
+    (8, "Adiciona strategy_signals.source_candle_open_time (DATETIME nullable) -- identidade determinística "
+        "do candle.open_time que gerou o sinal, nunca derivada de preço/created_at, nunca retroativa em "
+        "linhas legadas -- painel gráfico Fase 3.1.",
+     _migrate_to_v8),
 ]
 
 
@@ -685,6 +710,15 @@ def _v7_invariants_satisfied(conn: Connection) -> bool:
     )
 
 
+def _v8_invariants_satisfied(conn: Connection) -> bool:
+    """ALL structural invariants of v8 -- the column must exist AND remain
+    nullable (legacy signals are never backfilled)."""
+    return (
+        _column_exists(conn, "strategy_signals", "source_candle_open_time")
+        and _column_is_nullable(conn, "strategy_signals", "source_candle_open_time")
+    )
+
+
 _VERSION_INVARIANTS: dict[int, Callable[[Connection], bool]] = {
     1: _v1_invariants_satisfied,
     2: _v2_invariants_satisfied,
@@ -693,6 +727,7 @@ _VERSION_INVARIANTS: dict[int, Callable[[Connection], bool]] = {
     5: _v5_invariants_satisfied,
     6: _v6_invariants_satisfied,
     7: _v7_invariants_satisfied,
+    8: _v8_invariants_satisfied,
 }
 
 

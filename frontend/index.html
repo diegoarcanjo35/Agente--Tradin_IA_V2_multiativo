@@ -45,6 +45,35 @@
       <h2>Resumo por Símbolo (Carteira Multiativo)</h2>
       <div id="symbols-summary-box">Carregando...</div>
     </section>
+
+    <section class="card" id="chart-card">
+      <h2>Gráfico de Candles</h2>
+      <div class="chart-banner">PAPER LIVE MULTIATIVO — SIMULAÇÃO LOCAL — SEM ORDEM NA CORRETORA</div>
+      <div class="chart-header">
+        <label for="chart-symbol-select">Símbolo:</label>
+        <select id="chart-symbol-select"></select>
+        <span id="chart-timeframe" class="chip">TF: --</span>
+        <span id="chart-visual-price" class="chip">Preço: --</span>
+        <span id="chart-status" class="chip">Status: --</span>
+        <span id="chart-position-state" class="chip">SEM POSIÇÃO</span>
+        <span class="chart-window-buttons">
+          <button type="button" class="btn-secondary chart-window-btn" data-window="1h">1h</button>
+          <button type="button" class="btn-secondary chart-window-btn" data-window="4h">4h</button>
+          <button type="button" class="btn-secondary chart-window-btn" data-window="12h">12h</button>
+          <button type="button" class="btn-secondary chart-window-btn" data-window="24h">24h</button>
+          <button type="button" class="btn-secondary chart-window-btn" data-window="all">Tudo disponível</button>
+        </span>
+      </div>
+      <div id="chart-container">
+        <div id="chart-loading" class="chart-message">Carregando...</div>
+      </div>
+      <div id="chart-position-legend" class="chart-legend"></div>
+      <p class="chart-attribution">
+        Gráficos por TradingView Lightweight Charts™ — <a href="https://www.tradingview.com/" target="_blank" rel="noopener">https://www.tradingview.com/</a>
+        (Apache License 2.0, biblioteca servida localmente, sem CDN em tempo de execução — ver THIRD_PARTY_NOTICES.md).
+      </p>
+    </section>
+
     <section class="grid">
       <div class="card">
         <h2>Saldo &amp; Patrimônio (Equity)</h2>
@@ -113,6 +142,7 @@
     </footer>
   </main>
 
+  <script src="/static/vendor/lightweight-charts.standalone.production.js"></script>
   <script src="/static/app.js"></script>
 </body>
 </html>

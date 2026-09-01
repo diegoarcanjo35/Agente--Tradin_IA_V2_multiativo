@@ -135,6 +135,7 @@ def test_opening_a_new_position_is_rejected_when_engine_degraded(session_factory
     signal = Signal(
         symbol="BTCUSDT", direction="BUY", justification="teste",
         created_at=_utcnow(), observed_price=100.0, atr=1.0,
+        source_candle_open_time=_utcnow(),
         stop_loss=90.0, take_profit=110.0, params={},
     )
     context = RiskContext(

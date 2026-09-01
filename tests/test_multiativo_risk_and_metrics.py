@@ -29,7 +29,8 @@ def test_engine_degraded_blocks_new_entries_but_never_closes():
 
     signal = Signal(
         symbol="BTCUSDT", direction="BUY", justification="teste", created_at=NOW,
-        observed_price=100.0, atr=1.0, stop_loss=95.0, take_profit=110.0, params={},
+        observed_price=100.0, atr=1.0, source_candle_open_time=NOW,
+        stop_loss=95.0, take_profit=110.0, params={},
     )
     ctx = base_risk_context(engine_degraded=True)
     result = engine.evaluate(signal, signal_id=1, context=ctx)
@@ -90,11 +91,13 @@ def test_global_exposure_limit_rejects_second_symbol_once_first_consumed_the_who
 
     btc_signal = Signal(
         symbol="BTCUSDT", direction="BUY", justification="t", created_at=NOW,
-        observed_price=100.0, atr=1.0, stop_loss=95.0, take_profit=110.0, params={},
+        observed_price=100.0, atr=1.0, source_candle_open_time=NOW,
+        stop_loss=95.0, take_profit=110.0, params={},
     )
     eth_signal = Signal(
         symbol="ETHUSDT", direction="BUY", justification="t", created_at=NOW,
-        observed_price=100.0, atr=1.0, stop_loss=95.0, take_profit=110.0, params={},
+        observed_price=100.0, atr=1.0, source_candle_open_time=NOW,
+        stop_loss=95.0, take_profit=110.0, params={},
     )
 
     # First signal: 0 exposure so far -> approved (sized to the cap, since

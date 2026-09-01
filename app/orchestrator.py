@@ -64,6 +64,7 @@ class Orchestrator:
         clock_provider: RemoteTimeProvider,
         price_state: dict[str, float] | None = None,
         funding_provider: "BybitFundingProvider | None" = None,
+        visual_price_state: dict[str, dict] | None = None,
     ):
         self.settings = settings
         self.session_factory = session_factory
@@ -77,6 +78,15 @@ class Orchestrator:
         # was built with; the orchestrator is the single writer, updated
         # from the candle that is actually driving each decision.
         self.price_state: dict[str, float] = price_state if price_state is not None else {}
+        # Fase 3.1 (painel gráfico): estado PURAMENTE VISUAL, nunca lido por
+        # nenhum código de estratégia/risco/execução -- só pela rota HTTP
+        # do painel. Um dict {"price": float, "at": datetime, "source":
+        # "forming_candle"|"last_closed_candle"} por símbolo, atualizado a
+        # cada tick() (mesmo em ticks sem candle novo) quando o provider
+        # expõe `get_visual_price()` -- ver app/market_data/bybit_provider.py.
+        self.visual_price_state: dict[str, dict] = (
+            visual_price_state if visual_price_state is not None else {}
+        )
         self._last_open_order_poll_at: datetime | None = None
         # Correção v1.1 #6: only ever set for BYBIT_DEMO (the only mode
         # with private-endpoint credentials) -- None means funding stays
@@ -148,6 +158,24 @@ class Orchestrator:
 
             fetch_result = self.market_data_provider.next_candle()
 
+            # Fase 3.1 (painel gráfico): captura o preço visual ANTES de
+            # qualquer `return` antecipado abaixo -- o provider já atualizou
+            # seu cache interno de "candle em formação" durante a chamada de
+            # next_candle() acima (mesmo em ticks sem candle novo/HOLD),
+            # então isso precisa rodar incondicionalmente aqui, não só no
+            # caminho de sucesso. Duck-typed (mesmo padrão de sync_cursor):
+            # REPLAY/PAPER_LOCAL nunca implementam get_visual_price, então
+            # nunca têm preço visual -- a rota do painel cai no fallback
+            # "último fechamento" (price_state) documentado.
+            get_visual_price = getattr(self.market_data_provider, "get_visual_price", None)
+            if get_visual_price is not None:
+                visual = get_visual_price()
+                if visual is not None:
+                    visual_price, visual_price_at = visual
+                    self.visual_price_state[self.settings.symbol] = {
+                        "price": visual_price, "at": visual_price_at, "source": "forming_candle",
+                    }
+
             if fetch_result.status == CandleFetchStatus.REPLAY_FINISHED:
                 # The ONLY status allowed to end the orchestrator's loop.
                 return {"status": "no_data"}
@@ -213,6 +241,7 @@ class Orchestrator:
             signal_row = repo.save_signal(
                 session, signal.symbol, signal.direction, signal.justification,
                 signal.observed_price, signal.atr, signal.params,
+                source_candle_open_time=signal.source_candle_open_time,
             )
             increment_session_counter(op_session, "signals_count")
 
@@ -402,6 +431,7 @@ class Orchestrator:
         signal_row = repo.save_signal(
             session, position.symbol, close_side, justification, candle.close, 0.0,
             {"trigger": trigger_kind, "trigger_price": trigger_price},
+            source_candle_open_time=candle.open_time,
         )
 
         common_fields = self._common_risk_fields(state, data_is_stale, clock_sync)
@@ -938,6 +968,19 @@ class MultiSymbolOrchestrator:
         # (always None here) keeps `orch.funding_provider is not None`
         # checks in API routes working unchanged for both orchestrator types.
         return next(iter(self.orchestrators.values())).funding_provider
+
+    @property
+    def price_state(self):
+        # The SAME shared dict object is injected into every underlying
+        # Orchestrator (see app/api/main.py::build_orchestrator) -- any one
+        # of them exposes the whole portfolio's prices.
+        return next(iter(self.orchestrators.values())).price_state
+
+    @property
+    def visual_price_state(self):
+        # Fase 3.1 (painel gráfico): same sharing pattern as price_state
+        # above -- one shared dict across every symbol.
+        return next(iter(self.orchestrators.values())).visual_price_state
 
     @property
     def engine_degraded(self) -> bool:

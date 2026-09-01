@@ -125,7 +125,8 @@ def test_pause_always_allowed_blocks_only_new_entries_not_closes(tmp_path):
     entry_result = engine.evaluate(
         __import__("app.strategy.schemas", fromlist=["Signal"]).Signal(
             symbol="BTCUSDT", direction="BUY", justification="teste", created_at=base_risk_context().now,
-            observed_price=100.0, atr=1.0, stop_loss=90.0, take_profit=110.0, params={},
+            observed_price=100.0, atr=1.0, source_candle_open_time=base_risk_context().now,
+            stop_loss=90.0, take_profit=110.0, params={},
         ),
         signal_id=1, context=base_risk_context(operational_state="PAUSADO"),
     )

@@ -159,11 +159,29 @@ def get_last_candle_open_time(session: Session, symbol: str, timeframe: str) -> 
     return row
 
 
+def recent_candles(session: Session, symbol: str, timeframe: str, limit: int = 500) -> list[Candle]:
+    """Fase 3.1 (painel gráfico): as últimas `limit` velas FECHADAS, em
+    ordem cronológica -- busca as mais recentes primeiro (`ORDER BY
+    open_time DESC LIMIT`, o que usa diretamente o índice único composto
+    `uq_candle_symbol_timeframe_open_time` de `(symbol, timeframe,
+    open_time)`, sem full scan) e inverte em Python para a ordem que o
+    gráfico espera."""
+    rows = session.execute(
+        select(Candle)
+        .where(Candle.symbol == symbol, Candle.timeframe == timeframe)
+        .order_by(Candle.open_time.desc())
+        .limit(limit)
+    ).scalars().all()
+    return list(reversed(rows))
+
+
 def save_signal(session: Session, symbol: str, direction: str, justification: str,
-                 observed_price: float, atr: float, params: dict) -> StrategySignal:
+                 observed_price: float, atr: float, params: dict,
+                 source_candle_open_time: datetime | None = None) -> StrategySignal:
     s = StrategySignal(
         symbol=symbol, direction=direction, justification=justification,
         observed_price=observed_price, atr=atr, params_json=json.dumps(params),
+        source_candle_open_time=source_candle_open_time,
     )
     session.add(s)
     session.flush()

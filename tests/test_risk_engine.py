@@ -23,6 +23,7 @@ def make_signal(direction="BUY", stop_loss=39000.0, price=40000.0) -> Signal:
     return Signal(
         symbol="BTCUSDT", direction=direction, justification="test",
         created_at=NOW, observed_price=price, atr=100.0,
+        source_candle_open_time=NOW,
         stop_loss=stop_loss, take_profit=41000.0, params={},
     )
 

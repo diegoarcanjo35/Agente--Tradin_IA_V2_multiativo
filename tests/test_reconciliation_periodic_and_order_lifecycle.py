@@ -146,7 +146,8 @@ def test_reconciliation_stale_blocks_new_entries_but_evaluate_close_ignores_it()
 
     signal = Signal(
         symbol="BTCUSDT", direction="BUY", justification="teste", created_at=open_context.now,
-        observed_price=40000.0, atr=100.0, stop_loss=39000.0, take_profit=41000.0, params={},
+        observed_price=40000.0, atr=100.0, source_candle_open_time=open_context.now,
+        stop_loss=39000.0, take_profit=41000.0, params={},
     )
     open_result = engine.evaluate(signal, signal_id=1, context=open_context)
     assert open_result.approved is False

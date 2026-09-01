@@ -75,7 +75,8 @@ class StrategyEngine:
             return Signal(
                 symbol=self.symbol, direction="HOLD",
                 justification="Histórico insuficiente para calcular os indicadores ainda.",
-                created_at=utcnow(), observed_price=candle.close, atr=atr or 0.0,
+                created_at=utcnow(), observed_price=candle.close,
+                source_candle_open_time=candle.open_time, atr=atr or 0.0,
                 stop_loss=None, take_profit=None, params=params,
             )
 
@@ -88,7 +89,8 @@ class StrategyEngine:
                     f"ATR% {atr_pct:.5f} abaixo do filtro mínimo de volatilidade "
                     f"({cfg.min_atr_pct_of_price}); mercado considerado parado demais."
                 ),
-                created_at=utcnow(), observed_price=candle.close, atr=atr,
+                created_at=utcnow(), observed_price=candle.close,
+                source_candle_open_time=candle.open_time, atr=atr,
                 stop_loss=None, take_profit=None, params=params,
             )
         if atr_pct > cfg.max_atr_pct_of_price:
@@ -99,7 +101,8 @@ class StrategyEngine:
                     f"ATR% {atr_pct:.5f} acima do filtro máximo de volatilidade "
                     f"({cfg.max_atr_pct_of_price}); mercado considerado volátil demais."
                 ),
-                created_at=utcnow(), observed_price=candle.close, atr=atr,
+                created_at=utcnow(), observed_price=candle.close,
+                source_candle_open_time=candle.open_time, atr=atr,
                 stop_loss=None, take_profit=None, params=params,
             )
 
@@ -133,6 +136,7 @@ class StrategyEngine:
 
         return Signal(
             symbol=self.symbol, direction=direction, justification=justification,
-            created_at=utcnow(), observed_price=candle.close, atr=atr,
+            created_at=utcnow(), observed_price=candle.close,
+                source_candle_open_time=candle.open_time, atr=atr,
             stop_loss=stop_loss, take_profit=take_profit, params=params,
         )

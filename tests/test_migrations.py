@@ -193,7 +193,7 @@ def test_upgrade_v0_to_current_preserves_all_data_and_adds_new_schema(tmp_path):
 
     assert report.starting_version == 0
     assert report.ending_version == CURRENT_SCHEMA_VERSION
-    assert report.applied == [1, 2, 3, 4, 5, 6, 7]
+    assert report.applied == [1, 2, 3, 4, 5, 6, 7, 8]
     assert current_schema_version(engine) == CURRENT_SCHEMA_VERSION
 
     # 1. New columns exist.
@@ -335,7 +335,7 @@ def test_v1_database_only_needs_migration_2(tmp_path):
 
     report = run_migrations(engine)
     assert report.starting_version == 1
-    assert report.applied == [2, 3, 4, 5, 6, 7]  # never re-runs migration 1's orders rebuild
+    assert report.applied == [2, 3, 4, 5, 6, 7, 8]  # never re-runs migration 1's orders rebuild
 
     with engine.connect() as conn:
         cols = {r[1] for r in conn.execute(text("PRAGMA table_info(system_state)")).fetchall()}
@@ -498,7 +498,7 @@ def test_clock_out_of_sync_present_but_unique_index_missing_is_detected_as_v1(tm
     assert current_schema_version(engine) == 0  # stop_loss still NOT NULL -> v1 itself isn't satisfied either
 
     report = run_migrations(engine)
-    assert report.applied == [1, 2, 3, 4, 5, 6, 7]
+    assert report.applied == [1, 2, 3, 4, 5, 6, 7, 8]
     with engine.connect() as conn:
         assert conn.execute(
             text("SELECT name FROM sqlite_master WHERE type='index' AND name='uq_candle_symbol_timeframe_open_time'")
@@ -517,7 +517,7 @@ def test_is_close_present_but_stop_loss_still_not_null_is_detected_as_v0(tmp_pat
     assert current_schema_version(engine) == 0
 
     report = run_migrations(engine)
-    assert report.applied == [1, 2, 3, 4, 5, 6, 7]
+    assert report.applied == [1, 2, 3, 4, 5, 6, 7, 8]
     with engine.connect() as conn:
         assert conn.execute(text(
             "INSERT INTO orders (idempotency_key, risk_evaluation_id, symbol, side, qty, stop_loss, "
@@ -545,7 +545,7 @@ def test_recorded_v2_with_missing_index_raises_schema_divergence_error(tmp_path)
     # No further schema/data change happened as a side effect of detecting this.
     with engine.connect() as conn:
         migration_rows = conn.execute(text("SELECT version FROM schema_migrations ORDER BY version")).fetchall()
-        assert [r[0] for r in migration_rows] == [1, 2, 3, 4, 5, 6, 7]  # unchanged from before the sabotage
+        assert [r[0] for r in migration_rows] == [1, 2, 3, 4, 5, 6, 7, 8]  # unchanged from before the sabotage
 
 
 def test_differently_named_unique_index_still_satisfies_the_invariant(tmp_path):
@@ -577,7 +577,7 @@ def test_differently_named_unique_index_still_satisfies_the_invariant(tmp_path):
     assert current_schema_version(engine) == 2
 
     report = run_migrations(engine)
-    assert report.applied == [3, 4, 5, 6, 7]  # already fully v2 (custom index name counts) -- only v3+v4 are new, no divergence
+    assert report.applied == [3, 4, 5, 6, 7, 8]  # already fully v2 (custom index name counts) -- only v3+ are new, no divergence
 
 
 def test_fully_current_database_is_idempotent_under_strict_invariant_checking(tmp_path):
@@ -757,7 +757,7 @@ def test_partial_legacy_schema_with_no_history_migrates_and_validates_correctly(
 
     report = run_migrations(engine)
     assert report.starting_version == 0
-    assert report.applied == [1, 2, 3, 4, 5, 6, 7]
+    assert report.applied == [1, 2, 3, 4, 5, 6, 7, 8]
     assert current_schema_version(engine) == CURRENT_SCHEMA_VERSION
     with engine.connect() as conn:
         assert conn.execute(
@@ -889,7 +889,7 @@ def test_migration_v4_upgrades_a_real_v3_database_preserving_data_and_is_idempot
 
     report = run_migrations(engine)
     assert report.starting_version == 3
-    assert report.applied == [4, 5, 6, 7]
+    assert report.applied == [4, 5, 6, 7, 8]
     assert report.ending_version == CURRENT_SCHEMA_VERSION
     assert current_schema_version(engine) == CURRENT_SCHEMA_VERSION
 
@@ -1007,7 +1007,7 @@ def test_migration_v5_upgrades_a_real_v4_database_preserving_data_and_is_idempot
 
     report = run_migrations(engine)
     assert report.starting_version == 4
-    assert report.applied == [5, 6, 7]
+    assert report.applied == [5, 6, 7, 8]
     assert report.ending_version == CURRENT_SCHEMA_VERSION
     assert current_schema_version(engine) == CURRENT_SCHEMA_VERSION
 
@@ -1138,7 +1138,7 @@ def test_migration_v6_upgrades_a_real_v5_database_preserving_orders_fills_and_fu
 
     report = run_migrations(engine)
     assert report.starting_version == 5
-    assert report.applied == [6, 7]
+    assert report.applied == [6, 7, 8]
     assert report.ending_version == CURRENT_SCHEMA_VERSION
     assert current_schema_version(engine) == CURRENT_SCHEMA_VERSION
 
@@ -1259,7 +1259,7 @@ def test_migration_v7_upgrades_a_real_v6_database_preserving_data_and_is_idempot
 
     report = run_migrations(engine)
     assert report.starting_version == 6
-    assert report.applied == [7]
+    assert report.applied == [7, 8]
     assert report.ending_version == CURRENT_SCHEMA_VERSION
     assert current_schema_version(engine) == CURRENT_SCHEMA_VERSION
 
@@ -1366,6 +1366,125 @@ def test_migration_v7_rebuild_is_rolled_back_on_later_failure(tmp_path, monkeypa
     assert "symbols" not in {c[0] for c in schema_after["operational_sessions"]["columns"]}
     assert _row_counts(engine) == data_before
     assert current_schema_version(engine) == 6
+
+    monkeypatch.setitem(migrations_module.__dict__, "MIGRATIONS", real_migrations)
+    report = run_migrations(engine)
+    assert report.ending_version == CURRENT_SCHEMA_VERSION
+
+
+# --- Correção final da auditoria do PO (Fase 3.1): source_candle_open_time -
+
+def _make_real_v7_engine(tmp_path, name="real_v7.db"):
+    """A genuine, consistent v7 database (stopping exactly at the
+    previously-approved Fase 3 multiativo schema, with real rows in it) --
+    same pattern as `_make_real_v6_engine`, one version up."""
+    import app.persistence.migrations as migrations_module
+
+    engine = _make_legacy_v0_engine(tmp_path, name=name)
+    real_migrations = list(migrations_module.MIGRATIONS)
+    only_through_v7 = [m for m in real_migrations if m[0] <= 7]
+    try:
+        migrations_module.__dict__["MIGRATIONS"] = only_through_v7
+        report = run_migrations(engine)
+    finally:
+        migrations_module.__dict__["MIGRATIONS"] = real_migrations
+    assert report.ending_version == 7
+    return engine
+
+
+def test_migration_v8_upgrades_a_real_v7_database_preserving_data_and_is_idempotent(tmp_path):
+    """Upgrading from an actual, previously-approved v7 database (not a
+    v0-to-v8 shortcut) must preserve every row -- including the pre-existing
+    strategy_signals row seeded by `_seed_v0_sample_data`, which has NO
+    source_candle_open_time (legacy signal, correctly left NULL, never
+    backfilled/invented) -- add the new nullable column, and be a safe
+    no-op on immediate re-run."""
+    engine = _make_real_v7_engine(tmp_path)
+    before_counts = _row_counts(engine)
+    assert current_schema_version(engine) == 7
+
+    report = run_migrations(engine)
+    assert report.starting_version == 7
+    assert report.applied == [8]
+    assert report.ending_version == CURRENT_SCHEMA_VERSION
+    assert current_schema_version(engine) == CURRENT_SCHEMA_VERSION
+
+    after_counts = _row_counts(engine)
+    for table, before in before_counts.items():
+        assert after_counts[table] == before, f"{table} lost rows during v8 migration"
+
+    with engine.connect() as conn:
+        cols = {r[1] for r in conn.execute(text("PRAGMA table_info(strategy_signals)")).fetchall()}
+        assert "source_candle_open_time" in cols
+
+        # The pre-existing legacy signal row got NULL, never an invented value.
+        row = conn.execute(text(
+            "SELECT source_candle_open_time FROM strategy_signals WHERE id = 1"
+        )).fetchone()
+        assert row == (None,)
+
+        # New column is immediately usable end-to-end with a real UTC value.
+        conn.execute(text(
+            "UPDATE strategy_signals SET source_candle_open_time = :t WHERE id = 1"
+        ), {"t": _now_iso()})
+        conn.commit()
+
+    # Idempotent re-run.
+    report_again = run_migrations(engine)
+    assert report_again.applied == []
+    assert current_schema_version(engine) == CURRENT_SCHEMA_VERSION
+    assert _row_counts(engine)["strategy_signals"] == before_counts["strategy_signals"]
+
+
+def test_migration_v8_only_recorded_history_with_v8_invariants_missing_is_rejected(tmp_path):
+    """A database claiming v8 without the real v8 structural invariant
+    (source_candle_open_time genuinely present and nullable) must be
+    rejected, not silently trusted."""
+    engine = _make_real_v7_engine(tmp_path, name="claims_v8_missing_invariants.db")
+    run_migrations(engine)  # real, consistent v8
+
+    with engine.begin() as conn:
+        conn.execute(text("ALTER TABLE strategy_signals RENAME TO strategy_signals_old"))
+        conn.execute(text(
+            "CREATE TABLE strategy_signals AS SELECT id, symbol, direction, justification, "
+            "observed_price, atr, params_json, created_at FROM strategy_signals_old"
+        ))
+        conn.execute(text("DROP TABLE strategy_signals_old"))
+
+    with pytest.raises(SchemaDivergenceError):
+        current_schema_version(engine)
+    with pytest.raises(SchemaDivergenceError):
+        run_migrations(engine)
+
+
+def test_migration_v8_add_column_is_rolled_back_on_later_failure(tmp_path, monkeypatch):
+    """Adversarial reproduction of the same DDL-rollback guarantee at the
+    v7->v8 boundary."""
+    import app.persistence.migrations as migrations_module
+
+    engine = _make_real_v7_engine(tmp_path, name="adversarial_v8_rollback.db")
+    real_migrations = list(migrations_module.MIGRATIONS)
+
+    schema_before = _full_schema_snapshot(engine)
+    data_before = _row_counts(engine)
+
+    def _leaks_a_column_then_fails(conn):
+        conn.execute(text("ALTER TABLE strategy_signals ADD COLUMN leaked INTEGER DEFAULT 0"))
+        raise RuntimeError("falha simulada APÓS uma alteração de esquema real (v8)")
+
+    monkeypatch.setitem(
+        migrations_module.__dict__, "MIGRATIONS",
+        [(8, "migração v8 adversarial (ALTER real, depois falha)", _leaks_a_column_then_fails)],
+    )
+
+    with pytest.raises(MigrationError):
+        run_migrations(engine)
+
+    schema_after = _full_schema_snapshot(engine)
+    assert schema_after == schema_before
+    assert "leaked" not in {c[0] for c in schema_after["strategy_signals"]["columns"]}
+    assert _row_counts(engine) == data_before
+    assert current_schema_version(engine) == 7
 
     monkeypatch.setitem(migrations_module.__dict__, "MIGRATIONS", real_migrations)
     report = run_migrations(engine)

@@ -67,6 +67,7 @@ def approved_open_order(
     signal = Signal(
         symbol=symbol, direction=side, justification="fixture de teste",
         created_at=NOW, observed_price=price, atr=100.0,
+        source_candle_open_time=NOW,
         stop_loss=stop_loss, take_profit=take_profit, params={},
     )
     result = engine.evaluate(signal, signal_id=signal_id, context=base_risk_context())

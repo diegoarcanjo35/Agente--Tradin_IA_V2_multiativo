@@ -308,6 +308,264 @@ async function refreshSymbolsSummary() {
   }
 }
 
+// Fase 3.1 (painel gráfico): TradingView Lightweight Charts, vendorizado
+// localmente (frontend/vendor/, ver THIRD_PARTY_NOTICES.md). Toda a lógica
+// abaixo é guardada por `typeof LightweightCharts !== "undefined"` -- a
+// biblioteca é carregada via <script> separado antes deste arquivo; sem
+// ela (ex.: o harness Node de tests/test_frontend_xss_safety.py, que faz
+// eval() deste arquivo inteiro sem a lib), nada de gráfico é executado,
+// nunca lança exceção.
+const CHART_UP_COLOR = "#34d399";
+const CHART_DOWN_COLOR = "#f87171";
+const CHART_STATE = {
+  chart: null, candleSeries: null, volumeSeries: null,
+  smaFastSeries: null, smaSlowSeries: null, symbol: null,
+  priceLines: [], zoneEls: [], lastCandles: [], activeWindow: "all",
+};
+
+// Pure function, deliberately mirroring app/strategy/engine.py::StrategyEngine._sma
+// (simple mean of the last `period` closes) -- kept standalone so it can be
+// tested directly against a known fixture (item 13 da matriz de testes),
+// independent of whether LightweightCharts is loaded.
+function computeSMA(candles, period) {
+  const out = [];
+  for (let i = 0; i < candles.length; i++) {
+    if (i + 1 < period) continue;
+    let sum = 0;
+    for (let j = i - period + 1; j <= i; j++) sum += candles[j].close;
+    out.push({ time: candles[i].time, value: sum / period });
+  }
+  return out;
+}
+
+function chartWindowSeconds(windowKey) {
+  const HOUR = 3600;
+  return { "1h": HOUR, "4h": 4 * HOUR, "12h": 12 * HOUR, "24h": 24 * HOUR }[windowKey] || null;
+}
+
+function clearPositionOverlay() {
+  CHART_STATE.priceLines.forEach((line) => {
+    if (CHART_STATE.candleSeries) CHART_STATE.candleSeries.removePriceLine(line);
+  });
+  CHART_STATE.priceLines = [];
+  CHART_STATE.zoneEls.forEach((el) => el.remove());
+  CHART_STATE.zoneEls = [];
+}
+
+function repositionPriceZones() {
+  const container = $("chart-container");
+  if (!container || !CHART_STATE.candleSeries) return;
+  CHART_STATE.zoneEls.forEach((el) => {
+    const topPrice = Number(el.dataset.topPrice);
+    const bottomPrice = Number(el.dataset.bottomPrice);
+    const yTop = CHART_STATE.candleSeries.priceToCoordinate(topPrice);
+    const yBottom = CHART_STATE.candleSeries.priceToCoordinate(bottomPrice);
+    if (yTop == null || yBottom == null) { el.style.display = "none"; return; }
+    el.style.display = "block";
+    el.style.top = `${Math.min(yTop, yBottom)}px`;
+    el.style.height = `${Math.max(2, Math.abs(yBottom - yTop))}px`;
+  });
+}
+
+function addPriceZone(container, topPrice, bottomPrice, className) {
+  const el = document.createElement("div");
+  el.className = `chart-price-zone ${className}`;
+  el.dataset.topPrice = String(topPrice);
+  el.dataset.bottomPrice = String(bottomPrice);
+  container.appendChild(el);
+  CHART_STATE.zoneEls.push(el);
+}
+
+function applyPositionOverlay(position, visualPrice) {
+  clearPositionOverlay();
+  const container = $("chart-container");
+  const stateChip = $("chart-position-state");
+  const legend = $("chart-position-legend");
+  clearChildren(legend);
+
+  if (!position) {
+    stateChip.textContent = "SEM POSIÇÃO";
+    return;
+  }
+  stateChip.textContent = position.side === "BUY" ? "COMPRADO" : "VENDIDO";
+
+  const entry = position.avg_entry_price;
+  const tp = position.take_profit;
+  const sl = position.stop_loss;
+
+  CHART_STATE.priceLines.push(CHART_STATE.candleSeries.createPriceLine({
+    price: entry, color: "#60a5fa", lineWidth: 2, lineStyle: 0, title: "Entrada",
+  }));
+  if (typeof visualPrice === "number") {
+    CHART_STATE.priceLines.push(CHART_STATE.candleSeries.createPriceLine({
+      price: visualPrice, color: "#e6e9f0", lineWidth: 1, lineStyle: 2, title: "Atual",
+    }));
+  }
+  if (tp != null) {
+    CHART_STATE.priceLines.push(CHART_STATE.candleSeries.createPriceLine({
+      price: tp, color: CHART_UP_COLOR, lineWidth: 2, lineStyle: 0, title: "Alvo (TP)",
+    }));
+    addPriceZone(container, entry, tp, "profit");
+  }
+  if (sl != null) {
+    CHART_STATE.priceLines.push(CHART_STATE.candleSeries.createPriceLine({
+      price: sl, color: CHART_DOWN_COLOR, lineWidth: 2, lineStyle: 0, title: "Stop (SL)",
+    }));
+    addPriceZone(container, entry, sl, "risk");
+  }
+  repositionPriceZones();
+
+  kvRow(legend, "Quantidade", position.qty.toFixed(6));
+  kvRow(legend, "Exposição (USD)", (position.qty * entry).toFixed(2));
+  if (tp != null) kvRow(legend, "Distância até o alvo", Math.abs(tp - (visualPrice != null ? visualPrice : entry)).toFixed(2));
+  if (sl != null) kvRow(legend, "Distância até o stop", Math.abs((visualPrice != null ? visualPrice : entry) - sl).toFixed(2));
+  const openedAt = new Date(position.opened_at);
+  const durationMin = Math.max(0, Math.round((Date.now() - openedAt.getTime()) / 60000));
+  kvRow(legend, "Duração", `${durationMin} min`);
+}
+
+function ensureChart(symbol) {
+  if (CHART_STATE.chart && CHART_STATE.symbol === symbol) return;
+  if (CHART_STATE.chart) {
+    CHART_STATE.chart.remove();
+    CHART_STATE.chart = null;
+  }
+  const container = $("chart-container");
+  clearChildren(container);
+  CHART_STATE.priceLines = [];
+  CHART_STATE.zoneEls = [];
+
+  const chart = LightweightCharts.createChart(container, {
+    layout: { background: { color: "#0c1120" }, textColor: "#e6e9f0" },
+    grid: { vertLines: { color: "#1c2333" }, horzLines: { color: "#1c2333" } },
+    rightPriceScale: { borderColor: "#26314a" },
+    timeScale: { borderColor: "#26314a", timeVisible: true, secondsVisible: false },
+    autoSize: true,
+  });
+  const candleSeries = chart.addCandlestickSeries({
+    upColor: CHART_UP_COLOR, downColor: CHART_DOWN_COLOR,
+    borderVisible: false, wickUpColor: CHART_UP_COLOR, wickDownColor: CHART_DOWN_COLOR,
+  });
+  const volumeSeries = chart.addHistogramSeries({
+    priceFormat: { type: "volume" }, priceScaleId: "volume",
+  });
+  volumeSeries.priceScale().applyOptions({ scaleMargins: { top: 0.8, bottom: 0 } });
+  const smaFastSeries = chart.addLineSeries({ color: "#fbbf24", lineWidth: 1, title: "SMA rápida" });
+  const smaSlowSeries = chart.addLineSeries({ color: "#60a5fa", lineWidth: 1, title: "SMA lenta" });
+
+  chart.timeScale().subscribeVisibleTimeRangeChange(repositionPriceZones);
+  if (typeof ResizeObserver !== "undefined") {
+    new ResizeObserver(repositionPriceZones).observe(container);
+  }
+
+  CHART_STATE.chart = chart;
+  CHART_STATE.candleSeries = candleSeries;
+  CHART_STATE.volumeSeries = volumeSeries;
+  CHART_STATE.smaFastSeries = smaFastSeries;
+  CHART_STATE.smaSlowSeries = smaSlowSeries;
+  CHART_STATE.symbol = symbol;
+}
+
+function applyChartWindow(windowKey) {
+  CHART_STATE.activeWindow = windowKey;
+  document.querySelectorAll(".chart-window-btn").forEach((btn) => {
+    btn.classList.toggle("active", btn.dataset.window === windowKey);
+  });
+  if (!CHART_STATE.chart || !CHART_STATE.lastCandles.length) return;
+  if (windowKey === "all") {
+    CHART_STATE.chart.timeScale().fitContent();
+    return;
+  }
+  const seconds = chartWindowSeconds(windowKey);
+  const lastTime = CHART_STATE.lastCandles[CHART_STATE.lastCandles.length - 1].time;
+  CHART_STATE.chart.timeScale().setVisibleRange({ from: lastTime - seconds, to: lastTime + 60 });
+}
+
+let chartControlsInitialized = false;
+
+function initChartControlsOnce() {
+  if (chartControlsInitialized) return;
+  chartControlsInitialized = true;
+  document.querySelectorAll(".chart-window-btn").forEach((btn) => {
+    btn.addEventListener("click", () => applyChartWindow(btn.dataset.window));
+  });
+}
+
+async function refreshChartSymbolOptions() {
+  const select = $("chart-symbol-select");
+  if (select.dataset.loaded === "1") return;
+  const { symbols } = await getJSON("/api/symbols");
+  clearChildren(select);
+  symbols.forEach((symbol) => {
+    const opt = document.createElement("option");
+    opt.value = symbol;
+    opt.textContent = symbol;
+    select.appendChild(opt);
+  });
+  if (symbols.length) select.dataset.loaded = "1";
+}
+
+async function refreshChart() {
+  if (typeof LightweightCharts === "undefined") return;
+  try {
+    await refreshChartSymbolOptions();
+    initChartControlsOnce();
+    const select = $("chart-symbol-select");
+    const symbol = select.value;
+    if (!symbol) return;
+
+    const requestedSymbol = symbol;
+    const body = await getJSON(`/api/chart-data?symbol=${encodeURIComponent(symbol)}&limit=1500`);
+    // Guarda contra corrida de troca de símbolo (item 11 da matriz de
+    // testes): se o usuário trocou de símbolo enquanto esta resposta
+    // estava a caminho, descarta -- nunca aplica dados do símbolo errado.
+    if (select.value !== requestedSymbol) return;
+
+    ensureChart(symbol);
+    $("chart-timeframe").textContent = `TF: ${body.timeframe}`;
+    $("chart-status").textContent = `Status: ${SYMBOL_HEALTH_LABELS[(body.symbol_health || {}).status] || "indisponível"}`;
+    $("chart-visual-price").textContent = body.visual_price != null
+      ? `Preço: ${body.visual_price.toFixed(2)} (${body.visual_price_source === "forming_candle" ? "ao vivo (visual)" : "último fechamento"})`
+      : "Preço: indisponível";
+
+    const candles = body.candles;
+    CHART_STATE.lastCandles = candles;
+    CHART_STATE.candleSeries.setData(candles.map((c) => ({ time: c.time, open: c.open, high: c.high, low: c.low, close: c.close })));
+    CHART_STATE.volumeSeries.setData(candles.map((c) => ({ time: c.time, value: c.volume, color: c.close >= c.open ? CHART_UP_COLOR : CHART_DOWN_COLOR })));
+    const cfg = body.strategy_config || { fast_period: 9, slow_period: 21 };
+    CHART_STATE.smaFastSeries.setData(computeSMA(candles, cfg.fast_period));
+    CHART_STATE.smaSlowSeries.setData(computeSMA(candles, cfg.slow_period));
+
+    const markers = (body.recent_signals || []).map((s) => ({
+      time: s.time,
+      position: s.direction === "BUY" ? "belowBar" : "aboveBar",
+      color: s.direction === "BUY" ? CHART_UP_COLOR : CHART_DOWN_COLOR,
+      shape: s.direction === "BUY" ? "arrowUp" : "arrowDown",
+      text: `${s.direction}${s.order_status ? ` (${ORDER_STATUS_LABELS[s.order_status] || s.order_status})` : ""}`,
+    }));
+    CHART_STATE.candleSeries.setMarkers(markers);
+
+    applyPositionOverlay(body.position, body.visual_price);
+    if (CHART_STATE.activeWindow === "all") CHART_STATE.chart.timeScale().fitContent();
+    else applyChartWindow(CHART_STATE.activeWindow);
+
+    const loading = $("chart-loading");
+    if (loading) loading.remove();
+  } catch (err) {
+    // Falha do gráfico nunca derruba o restante do painel (item 16 da
+    // matriz de testes) -- Promise.all em refreshAll() nunca vê esta
+    // rejeição.
+    const container = $("chart-container");
+    if (container && !document.getElementById("chart-error")) {
+      const msg = document.createElement("div");
+      msg.id = "chart-error";
+      msg.className = "chart-message";
+      msg.textContent = "Erro ao carregar o gráfico -- os demais painéis continuam funcionando normalmente.";
+      container.appendChild(msg);
+    }
+  }
+}
+
 async function refreshRisk() {
   const rows = await getJSON("/api/risk-evaluations?limit=20");
   setRows(
@@ -375,6 +633,7 @@ async function refreshAll() {
     refreshState(), refreshMetrics(), refreshAccount(), refreshSignals(),
     refreshRisk(), refreshAI(), refreshFailures(), refreshEquityCurve(),
     refreshSession(), refreshOrders(), refreshCosts(), refreshSymbolsSummary(),
+    refreshChart(),
   ]);
 }
 

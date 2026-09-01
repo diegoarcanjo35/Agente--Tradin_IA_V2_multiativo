@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, HTTPException, Request
 
 from app.core.config import RunMode
 from app.metrics.engine import ClosedTrade, OrderFillView, compute_cost_metrics, compute_metrics
@@ -298,6 +298,132 @@ def get_positions(request: Request, symbol: str | None = None):
             }
             for p in open_pos
         ]
+
+
+def _strategy_config_for_symbol(orch, symbol: str) -> dict:
+    """Fase 3.1 (painel gráfico): a configuração REAL entregue à
+    StrategyEngine do símbolo -- funciona tanto para `Orchestrator`
+    (monoativo) quanto para `MultiSymbolOrchestrator` (cada símbolo tem sua
+    própria instância, todas compartilhando o mesmo `StrategyConfig` por
+    valor -- ver app/api/main.py::build_orchestrator)."""
+    sub_orch = orch.orchestrators[symbol] if hasattr(orch, "orchestrators") else orch
+    cfg = sub_orch.strategy_engine.config
+    return {
+        "fast_period": cfg.fast_period, "slow_period": cfg.slow_period, "atr_period": cfg.atr_period,
+        "min_atr_pct_of_price": cfg.min_atr_pct_of_price, "max_atr_pct_of_price": cfg.max_atr_pct_of_price,
+        "stop_loss_atr_multiple": cfg.stop_loss_atr_multiple, "take_profit_atr_multiple": cfg.take_profit_atr_multiple,
+    }
+
+
+@router.get("/chart-data")
+def get_chart_data(request: Request, symbol: str, limit: int = 500):
+    """Fase 3.1 (painel gráfico): rota somente-leitura, estritamente
+    observacional -- nenhuma chamada de rede aqui (candles vêm da tabela
+    `candles`; preço visual vem de um cache em memória já atualizado pelo
+    orquestrador a cada tick, nunca por uma consulta nova à corretora).
+
+    `limit` é sempre NORMALIZADO (nunca rejeitado) para o intervalo
+    `[50, 2000]` -- contrato documentado em docs/PAINEL_GRAFICO.md."""
+    orch = request.app.state.orchestrator
+    if symbol not in _configured_symbols(orch):
+        raise HTTPException(status_code=404, detail=f"Símbolo não configurado: {symbol}")
+    limit = max(50, min(limit, 2000))
+    timeframe = "1m"
+
+    with session_scope(orch.session_factory) as session:
+        from sqlalchemy import select
+
+        from app.persistence.models import Order, RiskEvaluation, StrategySignal
+
+        candles = repo.recent_candles(session, symbol, timeframe, limit=limit)
+
+        # Preço visual: candle em formação (quando o provider expõe um,
+        # nunca REPLAY/PAPER_LOCAL) -- fallback honesto para o fechamento
+        # do último candle persistido, nunca fingindo tempo real.
+        visual = getattr(orch, "visual_price_state", {}).get(symbol)
+        if visual is not None:
+            visual_price = visual["price"]
+            visual_price_at = visual["at"].isoformat()
+            visual_price_source = "forming_candle"
+        elif candles:
+            last = candles[-1]
+            visual_price = last.close
+            visual_price_at = last.open_time.isoformat()
+            visual_price_source = "last_closed_candle"
+        else:
+            visual_price, visual_price_at, visual_price_source = None, None, None
+
+        open_pos = repo.open_positions(session, symbol)
+        position = None
+        if open_pos:
+            p = open_pos[0]
+            position = {
+                "side": p.side, "qty": p.qty, "avg_entry_price": p.avg_entry_price,
+                "stop_loss": p.stop_loss, "take_profit": p.take_profit,
+                "opened_at": p.opened_at.isoformat(),
+            }
+
+        # Correção final da auditoria (Fase 3.1): o marcador usa
+        # EXCLUSIVAMENTE `signal.source_candle_open_time` -- a identidade
+        # determinística do candle.open_time gravada no momento da criação
+        # do sinal (app/strategy/engine.py::StrategyEngine.on_candle e
+        # app/orchestrator.py, nunca inferida por preço ou por
+        # created_at). Um sinal legado sem esse valor (coluna nullable,
+        # nunca retroativamente preenchida -- ver migração v8) é OMITIDO
+        # dos marcadores do gráfico; o sinal em si permanece visível em
+        # /api/signals normalmente, apenas sem posição no gráfico.
+        signal_rows = repo.recent_signals(session, limit=20, symbol=symbol)
+        recent_signals = []
+        for s in signal_rows:
+            if s.direction not in ("BUY", "SELL"):
+                continue
+            if s.source_candle_open_time is None:
+                continue
+            candle_time = int(s.source_candle_open_time.timestamp())
+            order_status = None
+            risk_eval = session.execute(
+                select(RiskEvaluation).where(RiskEvaluation.signal_id == s.id)
+            ).scalars().first()
+            if risk_eval is not None:
+                order = session.execute(
+                    select(Order).where(Order.risk_evaluation_id == risk_eval.id)
+                ).scalars().first()
+                if order is not None:
+                    order_status = order.status
+            recent_signals.append({
+                "time": candle_time, "direction": s.direction,
+                "price": s.observed_price, "justification": s.justification,
+                "order_status": order_status,
+                # Fase 3.1: `realized_pnl` por sinal individual não é
+                # rastreável de forma confiável nesta fundação -- Position
+                # é um agregado sem FK de volta ao sinal/ordem que a abriu.
+                # Nunca fabricado; sempre `None` (o frontend exibe
+                # "indisponível").
+                "realized_pnl": None,
+            })
+
+        symbols_health = _symbols_health_dict(request, orch)["symbols_health"]
+        symbol_health = symbols_health["per_symbol"].get(symbol)
+
+        from datetime import datetime, timezone
+
+        return {
+            "symbol": symbol, "timeframe": timeframe,
+            "candles": [
+                {
+                    "time": int(c.open_time.timestamp()), "open": c.open, "high": c.high,
+                    "low": c.low, "close": c.close, "volume": c.volume,
+                }
+                for c in candles
+            ],
+            "visual_price": visual_price, "visual_price_at": visual_price_at,
+            "visual_price_source": visual_price_source,
+            "strategy_config": _strategy_config_for_symbol(orch, symbol),
+            "position": position,
+            "recent_signals": recent_signals,
+            "symbol_health": symbol_health,
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+        }
 
 
 @router.get("/equity-curve")

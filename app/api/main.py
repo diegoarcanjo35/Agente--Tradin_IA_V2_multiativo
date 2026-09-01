@@ -200,6 +200,12 @@ def build_orchestrator(settings, bybit_transport=None) -> Orchestrator | MultiSy
     def price_provider(symbol: str) -> float:
         return price_state.get(symbol, 0.0)
 
+    # Fase 3.1 (painel gráfico): estado PURAMENTE VISUAL (preço do candle
+    # em formação), keyed by symbol -- nunca lido por nenhum código de
+    # estratégia/risco/execução, só pela rota GET /api/chart-data. Mesmo
+    # padrão de compartilhamento de `price_state` acima.
+    visual_price_state: dict[str, dict] = {}
+
     execution_engine, clock_provider, funding_provider, transport = _build_shared_execution_pipeline(
         settings, price_provider, bybit_transport
     )
@@ -258,6 +264,7 @@ def build_orchestrator(settings, bybit_transport=None) -> Orchestrator | MultiSy
             clock_provider=clock_provider,
             price_state=price_state,
             funding_provider=funding_provider,
+            visual_price_state=visual_price_state,
         )
 
     orchestrator: Orchestrator | MultiSymbolOrchestrator

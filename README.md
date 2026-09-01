@@ -73,6 +73,16 @@ de porta/banco em relação a uma instalação V1 monoativo no mesmo host
 multiativo autenticado (`BYBIT_DEMO`); sem promessa de rentabilidade;
 cooldown/kill-switch permanecem globais ao portfólio, não por símbolo.
 
+## Painel gráfico (Fase 3.1)
+
+O painel web (`http://127.0.0.1:8001`) ganhou um card "Gráfico de Candles"
+por símbolo — candles OHLC, volume, SMA rápida/lenta, marcadores de sinal e
+linhas/faixas de posição, usando TradingView Lightweight Charts™
+vendorizado localmente (sem CDN em runtime — ver `THIRD_PARTY_NOTICES.md`).
+Estritamente observacional: nenhum controle de execução manual. Ver
+`docs/PAINEL_GRAFICO.md` para arquitetura completa, contrato da API
+(`GET /api/chart-data`) e legenda de cores.
+
 ## Como gerar credenciais Bybit Demo Trading
 
 Ver `docs/OPERACAO_DEMO.md`.

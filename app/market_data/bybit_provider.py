@@ -123,6 +123,14 @@ class BybitDemoMarketDataProvider:
         self._consecutive_failures = 0
         self._pending_queue: list[CandleTick] = []
         self._pending_gap: tuple[datetime, datetime] | None = None
+        # Fase 3.1 (painel gráfico): o candle ainda em formação -- ou seja,
+        # a linha mais recente que _fetch_window traz mas que o próprio
+        # loop de "still forming" descarta (nunca é fechado/persistido) --
+        # é capturado aqui como um valor PURAMENTE VISUAL. Nunca entra em
+        # `_pending_queue`, nunca move `_last_processed_open_time`, nunca
+        # aciona StrategyEngine/RiskEngine -- ver get_visual_price().
+        self._forming_price: float | None = None
+        self._forming_price_at: datetime | None = None
 
     def sync_cursor(self, persisted_open_time: datetime | None) -> None:
         """Correction v1.4 #2: called by the orchestrator with the most
@@ -223,6 +231,10 @@ class BybitDemoMarketDataProvider:
         prev: datetime | None = None
         for open_time, candle in candidates:
             if now < open_time + self._interval_duration:
+                # Fase 3.1: captura o preço em formação antes de descartar
+                # a linha -- puramente visual, ver __init__ e get_visual_price().
+                self._forming_price = candle.close
+                self._forming_price_at = utcnow()
                 break  # still forming -- never let an open candle in
             if prev is not None and open_time != prev + self._interval_duration:
                 gap = (prev + self._interval_duration, open_time)
@@ -330,6 +342,9 @@ class BybitDemoMarketDataProvider:
                     gap = (expected, open_time)
                     break
                 if now < open_time + self._interval_duration:
+                    # Fase 3.1: mesma captura visual do bootstrap, ver acima.
+                    self._forming_price = candle.close
+                    self._forming_price_at = utcnow()
                     break  # still forming -- never let an open candle into the processed range
                 usable.append((open_time, candle))
                 prev = open_time
@@ -377,6 +392,22 @@ class BybitDemoMarketDataProvider:
     @property
     def consecutive_failures(self) -> int:
         return self._consecutive_failures
+
+    def get_visual_price(self) -> tuple[float, datetime] | None:
+        """Fase 3.1 (painel gráfico): o preço de fechamento do candle AINDA
+        EM FORMAÇÃO, se algum já foi observado nesta sessão do provider --
+        ou `None` caso contrário (símbolo recém-configurado, ou nenhuma
+        chamada de rede ainda observou uma linha em formação). Puramente
+        observacional -- nunca lido por nenhum código de estratégia/risco/
+        execução, apenas pela rota HTTP somente-leitura do painel (via
+        `Orchestrator.tick()` -> `visual_price_state`, ver
+        app/orchestrator.py). `ReplayMarketDataProvider`/`ListMarketDataProvider`
+        deliberadamente NÃO implementam este método -- o acesso em
+        `Orchestrator.tick()` é duck-typed (`getattr(..., "get_visual_price",
+        None)`), então REPLAY/PAPER_LOCAL nunca têm preço visual."""
+        if self._forming_price is None:
+            return None
+        return self._forming_price, self._forming_price_at
 
 
 class BybitServerTimeProvider:
