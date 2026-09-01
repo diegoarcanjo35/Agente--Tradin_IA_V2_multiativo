@@ -10,6 +10,20 @@ O teste `tests/test_reproducible_fixture.py` recalcula cada fórmula abaixo à
 mão a partir de `fixtures/reproducible_trades.json` e compara com a saída do
 motor. Um auditor pode reproduzir os mesmos números manualmente.
 
+## Consolidado vs. por símbolo (Fase 3 multiativo)
+
+`app/metrics/engine.py` não muda nesta fundação — permanece uma função pura
+sobre uma lista plana de `ClosedTrade`. `GET /api/metrics`
+(`app/api/routes_dashboard.py`) é quem agrupa: chama `compute_metrics()`
+**uma vez com todas as posições fechadas** (resultado consolidado, chaves de
+topo inalteradas — compatibilidade total com instalações monoativo) e **uma
+vez por símbolo configurado**, filtrando as mesmas linhas por `symbol` antes
+de cada chamada, expondo o resultado aditivo em `per_symbol: {SYMBOL:
+{...}}`. Funding segue a mesma lógica: somado via `repo.funding_total(session,
+symbol)` por símbolo configurado, nunca uma soma irrestrita de toda a tabela
+`funding_events` (o que incluiria incorretamente símbolos fora da
+configuração atual). Ver `tests/test_multiativo_risk_and_metrics.py::test_per_symbol_metrics_sum_to_consolidated`.
+
 ## Fórmulas
 
 - **Lucro bruto** = soma dos `realized_pnl` positivos.

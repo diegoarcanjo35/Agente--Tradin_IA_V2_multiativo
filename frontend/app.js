@@ -241,11 +241,71 @@ async function refreshSignals() {
     document.querySelector("#signals-table tbody"),
     rows.map((r) => [
       new Date(r.created_at).toLocaleString("pt-BR"),
+      r.symbol,
       translateDirection(r.direction),
       r.observed_price.toFixed(2),
       r.justification,
     ])
   );
+}
+
+// Fase 3 multiativo: um card por símbolo configurado -- preço/último candle
+// (via posição ou métricas mais recentes disponíveis), defasagem/saúde,
+// sinal, posição, exposição e PnL. Constrói tudo via createElement/
+// textContent (nunca innerHTML), mesmo padrão de kvRow/buildRow acima.
+const SYMBOL_HEALTH_LABELS = {
+  INICIANDO: "INICIANDO", SAUDAVEL: "SAUDÁVEL",
+  DEGRADADO: "DEGRADADO", PARADO: "PARADO", ENCERRANDO: "ENCERRANDO",
+};
+
+async function refreshSymbolsSummary() {
+  const [symbolsResp, state, positions, metrics] = await Promise.all([
+    getJSON("/api/symbols"), getJSON("/api/state"), getJSON("/api/positions"), getJSON("/api/metrics"),
+  ]);
+  const symbols = symbolsResp.symbols || [];
+  const health = (state.symbols_health && state.symbols_health.per_symbol) || {};
+  const perSymbolMetrics = metrics.per_symbol || {};
+  const positionsBySymbol = {};
+  positions.forEach((p) => { positionsBySymbol[p.symbol] = p; });
+
+  const box = $("symbols-summary-box");
+  clearChildren(box);
+
+  symbols.forEach((symbol) => {
+    const wrapper = document.createElement("div");
+    wrapper.className = "symbol-summary-card";
+
+    const title = document.createElement("h3");
+    title.textContent = symbol;
+    wrapper.appendChild(title);
+
+    const h = health[symbol] || {};
+    const healthLabel = SYMBOL_HEALTH_LABELS[h.status] || h.status || "indisponível";
+    const healthy = h.status === "SAUDAVEL";
+    kvRow(wrapper, "Saúde", healthLabel, healthy ? "" : "negative");
+    kvRow(wrapper, "Falhas consecutivas", h.consecutive_failures != null ? h.consecutive_failures : 0);
+    kvRow(wrapper, "Lacuna de dados", h.has_gap ? "SIM" : "não", h.has_gap ? "negative" : "");
+
+    const p = positionsBySymbol[symbol];
+    if (p) {
+      kvRow(wrapper, "Posição", `${translateDirection(p.side)} ${p.qty.toFixed(6)} @ ${p.avg_entry_price.toFixed(2)}`);
+      kvRow(wrapper, "Exposição (USD)", (p.qty * p.avg_entry_price).toFixed(2));
+    } else {
+      kvRow(wrapper, "Posição", "nenhuma posição aberta");
+    }
+
+    const m = perSymbolMetrics[symbol];
+    if (m) {
+      kvRow(wrapper, "PnL líquido", fmtNumber(m.net_profit), pnlClass(m.net_profit));
+      kvRow(wrapper, "Operações encerradas", m.closed_trades_count);
+    }
+
+    box.appendChild(wrapper);
+  });
+
+  if (symbols.length === 0) {
+    kvRow(box, "Símbolos", "nenhum símbolo configurado");
+  }
 }
 
 async function refreshRisk() {
@@ -266,6 +326,7 @@ async function refreshAI() {
     document.querySelector("#ai-table tbody"),
     rows.map((r) => [
       new Date(r.created_at).toLocaleString("pt-BR"),
+      r.symbol,
       translateDirection(r.recommendation),
       r.confidence.toFixed(2),
       r.reasoning_summary,
@@ -313,7 +374,7 @@ async function refreshAll() {
   await Promise.all([
     refreshState(), refreshMetrics(), refreshAccount(), refreshSignals(),
     refreshRisk(), refreshAI(), refreshFailures(), refreshEquityCurve(),
-    refreshSession(), refreshOrders(), refreshCosts(),
+    refreshSession(), refreshOrders(), refreshCosts(), refreshSymbolsSummary(),
   ]);
 }
 

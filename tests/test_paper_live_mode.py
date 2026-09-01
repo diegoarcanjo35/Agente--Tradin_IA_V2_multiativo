@@ -55,23 +55,24 @@ def test_paper_live_never_requires_credentials():
 
 def test_paper_live_wiring_never_constructs_bybit_demo_execution_engine_source():
     """Structural check (same spirit as app/ai_shadow/guard.py): the
-    PAPER_LIVE branch in app/api/main.py must never reference
-    BybitDemoExecutionEngine or require_bybit_credentials/http_post at all."""
+    PAPER_LIVE branch must never reference BybitDemoExecutionEngine or
+    require_bybit_credentials/http_post at all.
+
+    Fase 3 multiativo: the execution engine is now constructed once in
+    `_build_shared_execution_pipeline` (shared across every symbol) rather
+    than inline in `build_orchestrator` -- this test follows that move,
+    checking the function that actually constructs it now."""
     import ast
     import inspect
 
     import app.api.main as main_module
 
-    source = inspect.getsource(main_module.build_orchestrator)
+    source = inspect.getsource(main_module._build_shared_execution_pipeline)
     tree = ast.parse(source)
 
-    # Find the PAPER_LIVE branch's source slice via markers already present
-    # in the code (the branch is delimited by its own elif/else in the
-    # single build_orchestrator function) -- simplest robust check: the
-    # branch's own comment block never appears alongside a real
-    # BybitDemoExecutionEngine( call for PAPER_LIVE. We assert on the
-    # module-level fact instead: BybitDemoExecutionEngine is only
-    # constructed once in the whole function, inside the BYBIT_DEMO branch.
+    # Simplest robust check: BybitDemoExecutionEngine is only constructed
+    # once in the whole function, inside the BYBIT_DEMO branch -- never
+    # reachable from the PAPER_LIVE branch above it.
     calls = [n.func.id for n in ast.walk(tree) if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)]
     assert calls.count("BybitDemoExecutionEngine") == 1
 

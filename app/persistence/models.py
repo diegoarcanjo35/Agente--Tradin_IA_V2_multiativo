@@ -8,13 +8,16 @@ from datetime import datetime
 
 from sqlalchemy import (
     Boolean,
+    CheckConstraint,
     DateTime,
     Float,
     ForeignKey,
+    Index,
     Integer,
     String,
     Text,
     UniqueConstraint,
+    text,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
@@ -181,6 +184,15 @@ class Execution(Base):
 
 class Position(Base):
     __tablename__ = "positions"
+    __table_args__ = (
+        # Migration v7: at most one OPEN position per symbol at the database
+        # level -- partial index, so multiple historical CLOSED positions
+        # for the same symbol remain unaffected.
+        Index(
+            "uq_position_open_symbol", "symbol", unique=True,
+            sqlite_where=text("status = 'OPEN'"),
+        ),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     symbol: Mapped[str] = mapped_column(String(32), index=True)
@@ -286,11 +298,38 @@ class OperationalSession(Base):
     condition. Never mutated by anything outside app/sessions.py."""
 
     __tablename__ = "operational_sessions"
+    __table_args__ = (
+        # Migration v7 (correção obrigatória do PO): a row can never have
+        # BOTH `symbol` and `symbols` NULL -- every row must carry at least
+        # one form of its identity, legacy or new.
+        CheckConstraint("symbol IS NOT NULL OR symbols IS NOT NULL", name="ck_symbol_or_symbols"),
+        # Migration v7 (correção obrigatória do PO): at most one ACTIVE
+        # session (ended_at IS NULL) per portfolio (mode + ordered symbol
+        # list) -- legacy rows (symbols IS NULL) are excluded from this
+        # constraint entirely, so historical data can never violate it.
+        Index(
+            "uq_operational_session_active_per_portfolio", "mode", "symbols", unique=True,
+            sqlite_where=text("ended_at IS NULL AND symbols IS NOT NULL"),
+        ),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     session_uid: Mapped[str] = mapped_column(String(36), unique=True, index=True)
     mode: Mapped[str] = mapped_column(String(16))
-    symbol: Mapped[str] = mapped_column(String(32))
+    # Legacy scalar symbol -- kept ONLY for backward compatibility with rows
+    # written before migration v7. New sessions populate it only when
+    # monoativo (exactly one symbol); NULL for genuinely multi-symbol
+    # sessions (a scalar cannot represent N symbols without lying). Never
+    # used for resume matching from v7 onward -- see `symbols` below and
+    # app/sessions.py::start_or_resume_session.
+    symbol: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    # Migration v7: canonical portfolio identity -- JSON array of the
+    # configured symbols, in configuration order (order is significant: it
+    # drives both the round-robin scheduler and the session fingerprint).
+    # NULL only for pre-v7 legacy rows, which are never backfilled and are
+    # never resume candidates. Every session created from v7 onward,
+    # including monoativo ones, always populates this.
+    symbols: Mapped[str | None] = mapped_column(Text, nullable=True)
     timeframe: Mapped[str] = mapped_column(String(8))
     started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

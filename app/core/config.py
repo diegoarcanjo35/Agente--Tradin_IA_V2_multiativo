@@ -4,6 +4,7 @@ the API surface, per the non-negotiable "no Demo/Real switch" requirement.
 """
 from __future__ import annotations
 
+import re
 from datetime import datetime, timezone
 from enum import Enum
 from functools import lru_cache
@@ -19,6 +20,32 @@ class UnsafeBindHostError(TradingSystemError):
     without explicitly opting in -- the control API (kill switch, etc.) has
     no authentication in this phase, so it must never be exposed by
     accident."""
+
+
+class AmbiguousSymbolConfigError(TradingSystemError):
+    """Fase 3 multiativo: raised when SYMBOL and SYMBOLS are both set but
+    disagree -- never chosen silently, see Settings._validate_symbols_
+    precedence."""
+
+
+class MultiSymbolNotSupportedError(TradingSystemError):
+    """Fase 3 multiativo: raised when more than one symbol is configured in
+    a context that must stay monoativo (BYBIT_DEMO authenticated trading)."""
+
+
+class V1CollisionError(TradingSystemError):
+    """Fase 3 multiativo: raised when a multi-symbol V2 instance is
+    configured with the V1 install's known port or database file -- refuses
+    to start rather than risk operating against/alongside V1's live state."""
+
+
+# V1's known port/database -- the V2 multiativo instance must never collide
+# with these when running with more than one symbol (single-symbol V2
+# installs are unaffected, for full backward compatibility).
+V1_KNOWN_PORT = 8000
+V1_KNOWN_DATABASE_FILENAME = "agente_trader_paper_live.db"
+
+_SYMBOL_PATTERN = re.compile(r"^[A-Z0-9]{5,20}$")
 
 
 LOCAL_BIND_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
@@ -117,7 +144,20 @@ class Settings(BaseSettings):
 
     database_url: str = Field(default="sqlite:///./agente_trader.db")
 
+    # Fase 3 multiativo: `symbol` (legacy scalar) is preserved for
+    # monoativo backward compatibility. `symbols` (ordered, canonical list)
+    # is the real source of truth from here on -- see
+    # `_resolve_symbols_precedence` below for exactly how the two combine.
+    # Both are always consistent with each other after validation: `symbol`
+    # always equals `symbols[0]`.
     symbol: str = Field(default="BTCUSDT")
+    # Typed as `str | list[str]` (not plain `list[str]`) so pydantic-settings
+    # never attempts to JSON-decode a CSV env value like "BTCUSDT,ETHUSDT"
+    # (which would raise before `_resolve_symbols_precedence` below even
+    # runs) -- `_resolve_symbols_precedence` always normalizes this to a
+    # genuine `list[str]` before the field is finally validated, so
+    # `settings.symbols` is a `list[str]` in practice, always.
+    symbols: str | list[str] = Field(default_factory=list)
 
     # Correction v1.2 #2: conservative, configurable polling cadence for
     # BYBIT_DEMO -- for a 1-minute timeframe there is no reason to poll
@@ -247,6 +287,79 @@ class Settings(BaseSettings):
     api_port: int = Field(default=8000)
     api_allow_external_bind: bool = Field(default=False)
     control_api_token: str = Field(default="")
+
+    @model_validator(mode="before")
+    @classmethod
+    def _resolve_symbols_precedence(cls, data):
+        """Fase 3 multiativo, item 1 do brief: `SYMBOLS` (CSV) wins when
+        set. `SYMBOL` alone means monoativo (`symbols = [SYMBOL]`, 100%
+        compatible with today). When BOTH are set, they must be consistent
+        (`SYMBOL == symbols[0]`) -- an explicit mismatch is rejected as
+        ambiguous configuration, NEVER resolved silently by picking one.
+        Runs as a model-level `mode="before"` validator so it sees the
+        fully merged data (env vars, `.env` file, or direct kwargs in
+        tests) before per-field validation/defaults apply."""
+        if not isinstance(data, dict):
+            return data
+
+        raw_symbol = data.get("symbol")
+        raw_symbols = data.get("symbols")
+
+        def _parse_list(value) -> list[str]:
+            if value is None:
+                return []
+            if isinstance(value, (list, tuple)):
+                items = list(value)
+            elif isinstance(value, str):
+                items = value.split(",")
+            else:
+                raise ValueError(
+                    f"SYMBOLS deve ser uma string separada por vírgulas ou uma lista; "
+                    f"recebido tipo {type(value).__name__}."
+                )
+            normalized: list[str] = []
+            for item in items:
+                s = str(item).strip().upper()
+                if not s:
+                    continue
+                if s not in normalized:  # dedup, preserving first-occurrence order
+                    normalized.append(s)
+            return normalized
+
+        if raw_symbols is not None:
+            # SYMBOLS was explicitly provided (env var, .env, or kwarg) --
+            # an empty result after parsing (e.g. "   ,  ,") is an explicit
+            # configuration error, never silently treated as "not set".
+            final_symbols = _parse_list(raw_symbols)
+            if not final_symbols:
+                raise ValueError(
+                    "SYMBOLS foi definido mas não resultou em nenhum símbolo válido após o parsing "
+                    f"(valor recebido: {raw_symbols!r})."
+                )
+            if raw_symbol not in (None, ""):
+                normalized_symbol = str(raw_symbol).strip().upper()
+                if normalized_symbol != final_symbols[0]:
+                    raise AmbiguousSymbolConfigError(
+                        f"Configuração ambígua: SYMBOL={raw_symbol!r} não corresponde ao primeiro "
+                        f"símbolo de SYMBOLS ({final_symbols[0]!r}). Defina apenas SYMBOLS, ou "
+                        f"torne SYMBOL consistente com ele -- nunca escolhido silenciosamente."
+                    )
+        elif raw_symbol not in (None, ""):
+            final_symbols = [str(raw_symbol).strip().upper()]
+        else:
+            final_symbols = ["BTCUSDT"]  # matches the pre-existing `symbol` field default
+
+        for s in final_symbols:
+            if not _SYMBOL_PATTERN.match(s):
+                raise ValueError(
+                    f"Símbolo inválido {s!r} em SYMBOLS/SYMBOL. Formato esperado: "
+                    f"{_SYMBOL_PATTERN.pattern!r} (letras maiúsculas e dígitos, 5 a 20 caracteres)."
+                )
+
+        data = dict(data)
+        data["symbols"] = final_symbols
+        data["symbol"] = final_symbols[0]
+        return data
 
     @field_validator("partial_fill_policy")
     @classmethod
@@ -389,6 +502,28 @@ class Settings(BaseSettings):
                 "configurados via variáveis de ambiente."
             )
 
+    def assert_no_v1_collision(self) -> None:
+        """Fase 3 multiativo, item 2 do brief: quando multiativo (>1
+        símbolo), recusa a porta e o nome de arquivo de banco conhecidos da
+        V1 monoativo -- evita colisão acidental de processo/porta/banco.
+        Instalações monoativo (1 símbolo) nunca são afetadas por este
+        guard, preservando retrocompatibilidade total."""
+        if len(self.symbols) <= 1:
+            return
+        if self.api_port == V1_KNOWN_PORT:
+            raise V1CollisionError(
+                f"API_PORT={self.api_port} colide com a porta conhecida da V1 monoativo "
+                f"({V1_KNOWN_PORT}). Configuração multiativo (SYMBOLS com mais de um símbolo) "
+                f"recusada para evitar colisão acidental com a V1."
+            )
+        db_filename = self.database_url.rsplit("/", 1)[-1]
+        if db_filename == V1_KNOWN_DATABASE_FILENAME:
+            raise V1CollisionError(
+                f"DATABASE_URL aponta para o nome de arquivo conhecido do banco da V1 "
+                f"({V1_KNOWN_DATABASE_FILENAME!r}). Configuração multiativo recusada para evitar "
+                f"colisão acidental com a V1."
+            )
+
     def assert_safe_bind_host(self) -> None:
         if self.api_host not in LOCAL_BIND_HOSTS and not self.api_allow_external_bind:
             raise UnsafeBindHostError(
@@ -405,5 +540,14 @@ def get_settings() -> Settings:
     if settings.mode == RunMode.BYBIT_DEMO:
         assert_consistent_bybit_environment(settings.bybit_base_url, settings.bybit_ws_url)
         settings.require_bybit_credentials()
+        # Fase 3 multiativo, item 1 do brief: BYBIT_DEMO autenticado
+        # permanece monoativo nesta fase -- falha cedo, nunca tenta operar
+        # múltiplos símbolos autenticados.
+        if len(settings.symbols) > 1:
+            raise MultiSymbolNotSupportedError(
+                "O modo BYBIT_DEMO autenticado permanece monoativo nesta fase -- SYMBOLS com mais "
+                "de um símbolo não é suportado. Configure SYMBOL (ou SYMBOLS com um único símbolo)."
+            )
     settings.assert_safe_bind_host()
+    settings.assert_no_v1_collision()
     return settings

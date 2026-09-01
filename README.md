@@ -58,6 +58,21 @@ Novas entradas (posições) exigem ativação explícita do operador em
 **qualquer** modo (`POST /api/operational-state/activate`) — o processo
 sempre inicia em `OBSERVANDO`, nunca `ATIVO`. Ver `docs/FASE_2.md`.
 
+## Multiativo (Fase 3, fundação)
+
+`SYMBOLS=BTCUSDT,ETHUSDT,SOLUSDT` (CSV) substitui `SYMBOL` para operar mais
+de um símbolo no mesmo processo, com scheduler round-robin sequencial,
+saúde por símbolo, e sessão/risco de portfólio. `SYMBOL` sozinho continua
+100% funcional para instalações monoativo. `BYBIT_DEMO` autenticado
+permanece monoativo nesta fase. Ver `docs/ARQUITETURA.md`, seção
+"Multiativo", para o desenho completo — inclusive o isolamento obrigatório
+de porta/banco em relação a uma instalação V1 monoativo no mesmo host
+(`docs/SEGURANCA.md`, seção "Isolamento V1 vs. V2").
+
+**Limitações desta fundação**: sem dinheiro real em nenhum modo; sem
+multiativo autenticado (`BYBIT_DEMO`); sem promessa de rentabilidade;
+cooldown/kill-switch permanecem globais ao portfólio, não por símbolo.
+
 ## Como gerar credenciais Bybit Demo Trading
 
 Ver `docs/OPERACAO_DEMO.md`.

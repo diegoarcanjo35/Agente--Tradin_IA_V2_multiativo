@@ -124,3 +124,73 @@ inicialização. Separado disso, `operational_state`
 (`INICIALIZANDO`/`OBSERVANDO`/`ATIVO`/`PAUSADO`/`BLOQUEADO`/`ENCERRANDO`,
 Fase 2, item 7.8) controla se a estratégia pode abrir novas posições —
 sempre nasce em `OBSERVANDO`, nunca `ATIVO` automaticamente.
+
+## Multiativo (Fase 3, fundação)
+
+### Configuração e precedência
+
+`SYMBOLS` (CSV, ex. `BTCUSDT,ETHUSDT,SOLUSDT`) substitui `SYMBOL` como fonte
+primária de verdade quando definido. A ordem de declaração é preservada (não
+reordenada alfabeticamente) — é essa ordem que define tanto o round-robin do
+scheduler quanto a identidade da sessão (ver abaixo). `SYMBOL` continua
+funcionando sozinho para instalações monoativo (`symbols = [SYMBOL]`, 100%
+do comportamento anterior preservado). Se ambos forem definidos, precisam
+ser consistentes (`SYMBOL == symbols[0]`) ou a inicialização é recusada como
+configuração ambígua — nunca escolhida silenciosamente (ver
+`app/core/config.py::Settings._resolve_symbols_precedence`). `BYBIT_DEMO`
+autenticado permanece monoativo nesta fase; com mais de um símbolo, o boot
+recusa `API_PORT=8000` e qualquer `DATABASE_URL` com o nome de arquivo
+conhecido da V1 (`agente_trader_paper_live.db`).
+
+### Scheduler — round-robin sequencial, sem concorrência
+
+`app/orchestrator.py::MultiSymbolOrchestrator` compõe uma instância de
+`Orchestrator` **por símbolo** (cada uma com seu próprio `MarketDataProvider`
+e `StrategyEngine` — isolamento total de backlog/cursor e de janelas móveis
+de indicador entre símbolos), todas compartilhando o mesmo `session_factory`
+(→ o mesmo `SystemState` singleton e a mesma `OperationalSession` de
+portfólio), `RiskEngine` e `ExecutionEngine`. Cada chamada de `tick()`
+continua processando **um símbolo por vez** — nunca múltiplas threads —
+preservando o mecanismo (executor único de `poll_engine.py`) que já garante
+hoje que duas decisões de risco nunca leem o mesmo saldo desatualizado. O
+símbolo processado é escolhido por um índice round-robin determinístico; um
+símbolo com falhas consecutivas (`SYMBOL_PARADO_THRESHOLD`, hoje 3) entra em
+backoff e tem seu turno pulado **na mesma chamada**, nunca atrasando o ciclo
+dos demais.
+
+### Saúde por símbolo (em memória, não persistida)
+
+`MultiSymbolOrchestrator.health: dict[symbol, SymbolHealth]` — estados
+`INICIANDO`/`SAUDAVEL`/`DEGRADADO`/`PARADO`/`ENCERRANDO`, reconstruído do
+zero (todos `INICIANDO`) a cada boot, exposto via `GET /api/state` tanto
+agregado (`portfolio`, regra de precedência do pior estado) quanto detalhado
+(`per_symbol`). O gate de ativação (`RiskEngine.evaluate()`) é **global e
+conservador** (AND estrito): novas entradas só são autorizadas quando
+**todos** os símbolos configurados estão `SAUDAVEL` e sem lacuna de dados —
+a falha de um símbolo bloqueia entradas em todos, mas nunca bloqueia
+fechamento/redução de posições existentes (mesma exceção já aplicada em
+`evaluate_close`).
+
+**`PARADO` nunca é um estado terminal.** Significa "circuito temporariamente
+aberto" após `SYMBOL_PARADO_THRESHOLD` (hoje 3) falhas consecutivas — o
+símbolo fica inelegível para o round-robin até `eligible_again_at`
+(`now + poll_backoff_max_seconds`, fixo, não exponencial). Passado esse
+instante, o símbolo volta **automaticamente** ao scheduler no próximo ciclo
+(`MultiSymbolOrchestrator.tick()`, `app/orchestrator.py`) — sem intervenção
+manual. Um único tick bem-sucedido zera `consecutive_failures` e retorna o
+símbolo direto a `SAUDAVEL`. A precedência de agregação
+(`ENCERRANDO > PARADO > DEGRADADO > INICIANDO > SAUDAVEL`) e o gate de
+ativação como AND estrito permanecem exatamente como descritos acima — esta
+correção não os altera, apenas documenta o comportamento de recuperação já
+implementado.
+
+### Risco e sessão — decisões explícitas desta fundação
+
+`RISK_MAX_TOTAL_EXPOSURE_USD`/`RISK_MAX_CONCURRENT_POSITIONS` permanecem
+globais em `RiskLimits`, computados sobre **todas** as posições abertas
+independente de símbolo (já era assim antes da Fase 3). Cooldown/kill-switch
+(`SystemState`) também permanecem globais — uma sequência de perdas em um
+símbolo pode gerar cooldown que bloqueia entradas em todos. A sessão
+operacional (`docs/SESSOES_OPERACIONAIS.md`) passa a ser **uma única sessão
+de portfólio**, identificada por `(mode, símbolos ordenados, timeframe,
+estratégia, limites de risco)` — nunca uma sessão por símbolo.

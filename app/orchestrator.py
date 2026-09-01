@@ -24,6 +24,7 @@ second place that touches Execution/Position/session counters.
 """
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime, time, timedelta, timezone
 
 from app.ai_shadow.agent import AIShadowAgent
@@ -830,3 +831,217 @@ class Orchestrator:
         )
         repo.record_security_event(session, "RECONCILIATION_MISMATCH", detail)
         return False
+
+
+# --- Fase 3 multiativo: round-robin scheduler over N per-symbol Orchestrators
+#
+# Deliberately does NOT change a single line of `Orchestrator` above -- that
+# class stays exactly as audited/tested for monoativo. Multiativo is built by
+# composing N `Orchestrator` instances (one per symbol, each with its own
+# market data provider + StrategyEngine, sharing the same session_factory /
+# execution_engine / risk_engine / DB), driven one-at-a-time by this wrapper.
+# Reusing the exact same `session_factory` is what makes SystemState (the
+# kill-switch/cooldown singleton) and the one portfolio-level
+# OperationalSession naturally shared across all symbols, with zero extra
+# plumbing -- both are already looked up by primary key / process-wide
+# `get_settings()` state, not by `self.settings.symbol`.
+#
+# `poll_engine.py`'s OWN `PollHealth` (is the single worker thread/executor
+# itself alive and cycling on schedule) is UNCHANGED and stays global -- it
+# is a process-liveness concept, equally valid for one symbol or many, since
+# the same worker services every symbol in round-robin. The per-symbol
+# health introduced here (`SymbolHealth`) is a DIFFERENT, market-data/
+# trading-domain concept ("is THIS symbol's data healthy right now") that
+# `poll_engine.py` has no business tracking.
+
+FAILURE_TICK_STATUSES = frozenset({"retryable_error", "fatal_error", "gap_detected"})
+
+# Fixed "N strikes" threshold before a symbol moves from DEGRADADO to
+# PARADO (and starts skipping its round-robin turns) -- deliberately a
+# plain constant, not a new Settings field, mirroring the existing
+# `risk_cooldown_after_losses` default of 3 elsewhere in this codebase
+# rather than growing the configuration surface for this foundation.
+SYMBOL_PARADO_THRESHOLD = 3
+
+
+@dataclass
+class SymbolHealth:
+    """Per-symbol health -- process-memory only, rebuilt from INICIANDO on
+    every boot (Fase 3 multiativo, decisão do PO: sem tabela nova)."""
+
+    status: str = "INICIANDO"  # INICIANDO | SAUDAVEL | DEGRADADO | PARADO | ENCERRANDO
+    consecutive_failures: int = 0
+    last_tick_started_at: datetime | None = None
+    last_tick_completed_at: datetime | None = None
+    last_tick_success_at: datetime | None = None
+    last_candle_persisted_at: datetime | None = None
+    last_error: str | None = None
+    eligible_again_at: datetime | None = None  # while PARADO: round-robin turn skipped until this instant
+    has_gap: bool = False
+
+    def is_healthy(self) -> bool:
+        return self.status == "SAUDAVEL"
+
+    def to_dict(self) -> dict:
+        return {
+            "status": self.status,
+            "consecutive_failures": self.consecutive_failures,
+            "last_tick_started_at": self.last_tick_started_at.isoformat() if self.last_tick_started_at else None,
+            "last_tick_completed_at": self.last_tick_completed_at.isoformat() if self.last_tick_completed_at else None,
+            "last_tick_success_at": self.last_tick_success_at.isoformat() if self.last_tick_success_at else None,
+            "last_candle_persisted_at": (
+                self.last_candle_persisted_at.isoformat() if self.last_candle_persisted_at else None
+            ),
+            "last_error": self.last_error,
+            "has_gap": self.has_gap,
+        }
+
+
+# Worst-to-best precedence for the aggregated portfolio status shown on the
+# dashboard (plan doc section 4) -- distinct from the boolean activation
+# gate below, which requires ALL symbols SAUDAVEL.
+_STATUS_PRECEDENCE = ["ENCERRANDO", "PARADO", "DEGRADADO", "INICIANDO", "SAUDAVEL"]
+
+
+class MultiSymbolOrchestrator:
+    """Round-robin scheduler over one `Orchestrator` per configured symbol.
+    Exposes the same `.tick()` / `.engine_degraded` surface `poll_engine.py`
+    already drives -- no change needed there for the scheduling itself."""
+
+    def __init__(self, orchestrators: dict[str, "Orchestrator"], symbols: list[str], settings=None):
+        if not orchestrators or set(orchestrators) != set(symbols):
+            raise ValueError("orchestrators deve ter exatamente uma entrada por símbolo em `symbols`.")
+        self.orchestrators = orchestrators
+        self.symbols = list(symbols)  # canonical configuration order -- the round-robin order
+        self._rr_index = 0
+        self.health: dict[str, SymbolHealth] = {s: SymbolHealth() for s in self.symbols}
+        self._engine_degraded = False
+        # The REAL, multi-symbol `Settings` object (not any per-symbol
+        # `model_copy`) -- kept so API routes that read `orch.settings.*`
+        # (mode, reconciliation intervals, risk limits, ...) work unchanged
+        # regardless of whether they hold an `Orchestrator` or a
+        # `MultiSymbolOrchestrator`. Falls back to the first underlying
+        # orchestrator's settings if not given (e.g. built by hand in a
+        # test) -- every field except `.symbol`/`.symbols` is identical
+        # across all of them anyway.
+        self.settings = settings if settings is not None else next(iter(orchestrators.values())).settings
+
+    @property
+    def session_factory(self):
+        # Every underlying Orchestrator shares the exact same session_factory
+        # (see app/api/main.py::build_orchestrator) -- exposed here purely
+        # so callers that don't care whether they hold an `Orchestrator` or a
+        # `MultiSymbolOrchestrator` (e.g. app/api/main.py::_graceful_shutdown)
+        # can keep using `orch.session_factory` unchanged.
+        return next(iter(self.orchestrators.values())).session_factory
+
+    @property
+    def funding_provider(self):
+        # BYBIT_DEMO (the only mode that ever sets a real funding provider)
+        # is guaranteed monoativo (Fase 3 multiativo, item 1) -- a
+        # MultiSymbolOrchestrator never genuinely has one, but exposing this
+        # (always None here) keeps `orch.funding_provider is not None`
+        # checks in API routes working unchanged for both orchestrator types.
+        return next(iter(self.orchestrators.values())).funding_provider
+
+    @property
+    def engine_degraded(self) -> bool:
+        return self._engine_degraded
+
+    @engine_degraded.setter
+    def engine_degraded(self, value: bool) -> None:
+        # Set externally by poll_engine.py (process/worker-level liveness) --
+        # propagated to every underlying Orchestrator unconditionally, same
+        # as before multiativo (a stuck worker blocks new entries on every
+        # symbol, not just one).
+        self._engine_degraded = value
+        for orch in self.orchestrators.values():
+            orch.engine_degraded = value
+
+    def _portfolio_healthy(self) -> bool:
+        return all(h.is_healthy() and not h.has_gap for h in self.health.values())
+
+    def _sync_engine_degraded_to_orchestrators(self) -> None:
+        """The activation gate is portfolio-wide (plan doc section 4): a
+        single symbol failing to be SAUDAVEL/synced/contínuo blocks new
+        entries on EVERY symbol, but never blocks closing/reducing (each
+        underlying Orchestrator already applies that exception in
+        RiskEngine.evaluate_close). Re-derived before every tick so it never
+        lags behind the latest per-symbol health."""
+        degraded = self._engine_degraded or not self._portfolio_healthy()
+        for orch in self.orchestrators.values():
+            orch.engine_degraded = degraded
+
+    def mark_shutting_down(self) -> None:
+        for h in self.health.values():
+            h.status = "ENCERRANDO"
+
+    def portfolio_status(self) -> dict:
+        statuses = [h.status for h in self.health.values()]
+        aggregated = next((s for s in _STATUS_PRECEDENCE if s in statuses), "SAUDAVEL")
+        healthy_count = sum(1 for h in self.health.values() if h.is_healthy())
+        return {
+            "portfolio": {"status": aggregated, "healthy_count": healthy_count, "total": len(self.symbols)},
+            "per_symbol": {s: h.to_dict() for s, h in self.health.items()},
+        }
+
+    def _update_health(self, symbol: str, now: datetime, result: dict) -> None:
+        h = self.health[symbol]
+        h.last_tick_completed_at = now
+        status = result.get("status", "")
+
+        if status in FAILURE_TICK_STATUSES:
+            h.consecutive_failures += 1
+            h.last_error = result.get("detail") or status
+            h.has_gap = status == "gap_detected"
+            if h.consecutive_failures >= SYMBOL_PARADO_THRESHOLD:
+                h.status = "PARADO"
+                symbol_orch = self.orchestrators[symbol]
+                backoff = symbol_orch.settings.poll_backoff_max_seconds
+                h.eligible_again_at = now + timedelta(seconds=backoff)
+            else:
+                h.status = "DEGRADADO"
+            return
+
+        # Any non-failure status (hold/no_new_candle/duplicate_candle/
+        # order_*/rejected/close_*/position_*) counts as a healthy tick --
+        # data is flowing and being processed normally for this symbol.
+        h.consecutive_failures = 0
+        h.last_error = None
+        h.has_gap = False
+        h.eligible_again_at = None
+        h.last_tick_success_at = now
+        if status not in ("no_new_candle", "duplicate_candle", "no_data"):
+            h.last_candle_persisted_at = now
+        h.status = "SAUDAVEL"
+
+    def tick(self) -> dict:
+        now = utcnow()
+        n = len(self.symbols)
+        for _ in range(n):
+            symbol = self.symbols[self._rr_index]
+            self._rr_index = (self._rr_index + 1) % n
+            h = self.health[symbol]
+            if h.status == "PARADO" and h.eligible_again_at is not None and now < h.eligible_again_at:
+                continue  # this symbol's turn is skipped -- never blocks the others
+
+            self._sync_engine_degraded_to_orchestrators()
+            h.last_tick_started_at = now
+            result = self.orchestrators[symbol].tick()
+            self._update_health(symbol, utcnow(), result)
+            return {**result, "symbol": symbol}
+
+        # Every configured symbol is currently in PARADO backoff -- a
+        # legitimate (if unhealthy) outcome, never an exception.
+        return {"status": "all_symbols_in_cooldown"}
+
+    def reconcile(self, session, state) -> None:
+        """Startup / on-demand full-portfolio reconciliation: runs every
+        underlying Orchestrator's own (already audited) `reconcile()` once.
+        Each call's own position/order queries are already global (not
+        symbol-filtered -- see `_reconcile_positions_step`), so this
+        guarantees every configured symbol is touched at least once, not
+        just whichever symbol happens to own the next periodic check inside
+        `tick()`."""
+        for symbol in self.symbols:
+            self.orchestrators[symbol].reconcile(session, state)

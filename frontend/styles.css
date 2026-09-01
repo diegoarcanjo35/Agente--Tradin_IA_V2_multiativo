@@ -96,6 +96,26 @@ main { padding: 20px; max-width: 1200px; margin: 0 auto; }
 
 .card h2 { font-size: 13px; text-transform: uppercase; color: var(--muted); margin: 0 0 10px; }
 
+/* Fase 3 multiativo: um card por símbolo dentro do card "Resumo por Símbolo". */
+#symbols-summary-box {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 14px;
+}
+
+.symbol-summary-card {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px 12px;
+}
+
+.symbol-summary-card h3 {
+  font-size: 14px;
+  margin: 0 0 8px;
+  color: var(--accent);
+}
+
 table { width: 100%; border-collapse: collapse; font-size: 13px; }
 th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--border); white-space: nowrap; }
 th { color: var(--muted); font-weight: 600; }

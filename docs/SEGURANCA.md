@@ -212,3 +212,29 @@ o kill switch) fica para uma fase futura.
   construção de linha (`buildRow`/`kvRow`) de `app.js` num shim mínimo de
   DOM via Node.js, injeta um payload clássico de XSS e comprova que ele
   chega como `textContent` puro, sem gerar nenhum nó filho.
+
+## Isolamento V1 vs. V2 (Fase 3 multiativo)
+
+A V2 multiativo nunca deve colidir com uma instalação V1 (monoativo)
+rodando no mesmo host:
+
+- **Porta**: quando mais de um símbolo está configurado (`len(SYMBOLS) > 1`),
+  `Settings.assert_no_v1_collision()` recusa `API_PORT=8000` (a porta
+  conhecida da V1) na inicialização — falha cedo, antes de qualquer bind.
+  `.env.example` da V2 já usa `API_PORT=8001` por padrão.
+- **Banco de dados**: o mesmo guard recusa `DATABASE_URL` cujo nome de
+  arquivo bata com o nome conhecido do banco da V1
+  (`agente_trader_paper_live.db`). `.env.example` da V2 usa
+  `agente_trader_multiativo_dev.db`.
+- **Instalações monoativo (1 símbolo) nunca são afetadas** por este guard —
+  retrocompatibilidade total com quem já roda a V2 com um único símbolo.
+- **Processo**: a V2 nunca importa, referencia ou toca no diretório, no
+  processo ou nas variáveis de ambiente da V1 — são bases de código e
+  processos totalmente independentes; o único ponto de contato é
+  intencional e histórico (o histórico Git da V1 foi usado para fundar o
+  repositório da V2 — ver o commit-base `fd22a7b8...` na branch
+  `fase-3-multiativo`), nunca em tempo de execução.
+- Testado em `tests/test_config_symbols.py`
+  (`test_multi_symbol_refuses_v1_known_port`,
+  `test_multi_symbol_refuses_v1_known_database_filename`,
+  `test_mono_symbol_is_never_affected_by_v1_guard`).

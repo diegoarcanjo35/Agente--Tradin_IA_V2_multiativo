@@ -61,6 +61,18 @@ Schema history:
             separate from the funding_events themselves and never derived
             from their MAX(occurred_at) (unsafe under newest-first
             pagination -- see app/execution/funding.py). See docs/METRICAS.md.
+  v6 -> v7  (Fase 3 multiativo, fundação): adds
+            operational_sessions.symbols (nullable JSON array of the
+            canonical, ordered symbol list) -- the new portfolio-level
+            session identity. Legacy rows keep `symbols = NULL` and are
+            never backfilled/rewritten (read-only history); only new
+            sessions populate it (app/sessions.py). Also creates a partial
+            UNIQUE index on positions(symbol) WHERE status='OPEN' -- closes
+            the one real duplicate-by-(symbol, natural identity) gap found
+            auditing the schema for multi-symbol support (nothing
+            previously stopped two OPEN rows for the same symbol at the
+            database level). See docs/MIGRACOES.md and
+            docs/ARQUITETURA.md ("Multiativo").
 """
 from __future__ import annotations
 
@@ -73,7 +85,7 @@ from sqlalchemy.engine import Connection, Engine
 
 from app.persistence.models import Base
 
-CURRENT_SCHEMA_VERSION = 6
+CURRENT_SCHEMA_VERSION = 7
 
 
 class MigrationError(Exception):
@@ -135,6 +147,39 @@ def _has_unique_index_on(conn: Connection, table: str, columns: set[str]) -> boo
         # PRAGMA index_list columns: (seq, name, unique, origin, partial)
         index_name, is_unique = index_row[1], index_row[2]
         if not is_unique:
+            continue
+        index_info = conn.execute(text(f"PRAGMA index_info({index_name})")).fetchall()
+        indexed_columns = {r[2] for r in index_info}  # (seqno, cid, name)
+        if indexed_columns == columns:
+            return True
+    return False
+
+
+def _has_check_constraint(conn: Connection, table: str, exact_fragment: str) -> bool:
+    """SQLite exposes no `PRAGMA` for CHECK constraints -- the only way to
+    detect one is to inspect the table's own recorded DDL text in
+    `sqlite_master`. Matched by an EXACT substring this module itself
+    always writes verbatim (never a loose/normalized comparison), so a
+    false positive is not possible; a false negative just means the
+    (idempotent) rebuild below runs again, which is always safe."""
+    row = conn.execute(
+        text("SELECT sql FROM sqlite_master WHERE type='table' AND name=:t"), {"t": table}
+    ).fetchone()
+    return row is not None and row[0] is not None and exact_fragment in row[0]
+
+
+def _has_unique_partial_index_on(conn: Connection, table: str, columns: set[str]) -> bool:
+    """Like `_has_unique_index_on`, but only counts a unique index that is
+    ALSO partial (`PRAGMA index_list`'s `partial` flag) -- a plain
+    (non-partial) unique index on the same columns would not satisfy this,
+    since it would forbid ANY two rows sharing those column values (e.g. two
+    historical CLOSED positions for the same symbol), not just two
+    simultaneously-OPEN ones."""
+    index_list = conn.execute(text(f"PRAGMA index_list({table})")).fetchall()
+    for index_row in index_list:
+        # PRAGMA index_list columns: (seq, name, unique, origin, partial)
+        index_name, is_unique, is_partial = index_row[1], index_row[2], index_row[4]
+        if not is_unique or not is_partial:
             continue
         index_info = conn.execute(text(f"PRAGMA index_info({index_name})")).fetchall()
         indexed_columns = {r[2] for r in index_info}  # (seqno, cid, name)
@@ -392,6 +437,129 @@ def _migrate_to_v6(conn: Connection) -> None:
         ))
 
 
+# Written verbatim into the rebuilt table's DDL below AND used as the exact
+# detection fragment for `_has_check_constraint` -- keep these in sync.
+_SYMBOL_OR_SYMBOLS_CHECK_SQL = "CHECK (symbol IS NOT NULL OR symbols IS NOT NULL)"
+
+
+def _migrate_to_v7(conn: Connection) -> None:
+    """Fase 3 multiativo (fundação + rodada de correção obrigatória do PO):
+
+    - `operational_sessions` gains `symbols` (nullable JSON, never
+      backfilled for pre-existing rows -- see module docstring) and
+      `symbol` is relaxed from NOT NULL to nullable (a genuinely
+      multi-symbol session leaves it NULL rather than lying with a single
+      value -- see app/sessions.py).
+    - `operational_sessions` gains `CHECK (symbol IS NOT NULL OR symbols IS
+      NOT NULL)` -- a row can never have BOTH null. Legacy rows already
+      satisfy this (`symbol NOT NULL`, `symbols NULL`); new rows satisfy it
+      by construction (`symbols` is always populated -- see
+      app/sessions.py::start_or_resume_session).
+    - `operational_sessions` gains a partial UNIQUE index on
+      `(mode, symbols) WHERE ended_at IS NULL AND symbols IS NOT NULL` --
+      at most one ACTIVE session per portfolio (mode + ordered symbol
+      list); legacy rows (`symbols IS NULL`) are excluded from this
+      constraint entirely, so historical data can never violate it.
+    - `positions` gains a partial UNIQUE index on `(symbol) WHERE
+      status='OPEN'`.
+
+    SQLite cannot drop a NOT NULL constraint or add a CHECK with a plain
+    ALTER TABLE, so -- same technique as `_migrate_to_v1`'s `orders`
+    rebuild -- the `operational_sessions` table is rebuilt: new shape
+    created (with the CHECK baked into the CREATE TABLE, the only place
+    SQLite accepts one), every existing row copied across unchanged
+    (`symbols` stays NULL for them, exactly as before -- legacy rows are
+    NEVER backfilled/rewritten), old table dropped, new one renamed into
+    place. Before creating the new-active-session-per-portfolio unique
+    index, pre-existing data is checked for violations first -- if found,
+    the migration raises and refuses to proceed rather than silently
+    deleting or "fixing" real rows (decisão do PO)."""
+    needs_sessions_rebuild = (
+        not _column_exists(conn, "operational_sessions", "symbols")
+        or not _column_is_nullable(conn, "operational_sessions", "symbol")
+        or not _has_check_constraint(conn, "operational_sessions", _SYMBOL_OR_SYMBOLS_CHECK_SQL)
+    )
+    if needs_sessions_rebuild:
+        conn.execute(text(
+            "CREATE TABLE operational_sessions_v7 ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+            "session_uid VARCHAR(36) NOT NULL, "
+            "mode VARCHAR(16) NOT NULL, "
+            "symbol VARCHAR(32), "
+            "symbols TEXT, "
+            "timeframe VARCHAR(8) NOT NULL, "
+            "started_at DATETIME NOT NULL, "
+            "ended_at DATETIME, "
+            "end_reason VARCHAR(255), "
+            "strategy_version VARCHAR(64) NOT NULL, "
+            "risk_config_json TEXT NOT NULL, "
+            "config_snapshot_json TEXT NOT NULL, "
+            "config_fingerprint VARCHAR(64), "
+            "status VARCHAR(16) NOT NULL DEFAULT 'INICIALIZANDO', "
+            "candles_count INTEGER NOT NULL DEFAULT 0, "
+            "signals_count INTEGER NOT NULL DEFAULT 0, "
+            "approvals_count INTEGER NOT NULL DEFAULT 0, "
+            "rejections_count INTEGER NOT NULL DEFAULT 0, "
+            "orders_count INTEGER NOT NULL DEFAULT 0, "
+            "fills_count INTEGER NOT NULL DEFAULT 0, "
+            "failures_count INTEGER NOT NULL DEFAULT 0, "
+            "reconciliations_count INTEGER NOT NULL DEFAULT 0, "
+            f"{_SYMBOL_OR_SYMBOLS_CHECK_SQL}"
+            ")"
+        ))
+        symbols_source_expr = (
+            "symbols" if _column_exists(conn, "operational_sessions", "symbols") else "NULL"
+        )
+        conn.execute(text(
+            "INSERT INTO operational_sessions_v7 (id, session_uid, mode, symbol, symbols, timeframe, "
+            "started_at, ended_at, end_reason, strategy_version, risk_config_json, config_snapshot_json, "
+            "config_fingerprint, status, candles_count, signals_count, approvals_count, rejections_count, "
+            "orders_count, fills_count, failures_count, reconciliations_count) "
+            f"SELECT id, session_uid, mode, symbol, {symbols_source_expr}, timeframe, "
+            "started_at, ended_at, end_reason, strategy_version, risk_config_json, config_snapshot_json, "
+            "config_fingerprint, status, candles_count, signals_count, approvals_count, rejections_count, "
+            "orders_count, fills_count, failures_count, reconciliations_count "
+            "FROM operational_sessions"
+        ))
+        conn.execute(text("DROP TABLE operational_sessions"))
+        conn.execute(text("ALTER TABLE operational_sessions_v7 RENAME TO operational_sessions"))
+        conn.execute(text(
+            "CREATE UNIQUE INDEX IF NOT EXISTS ix_operational_sessions_session_uid "
+            "ON operational_sessions (session_uid)"
+        ))
+
+    if not _has_unique_partial_index_on(conn, "operational_sessions", {"mode", "symbols"}):
+        # Decisão do PO: verificar duplicidades ativas ANTES de criar o
+        # índice -- nunca apagar/corrigir silenciosamente dados reais. Uma
+        # violação aqui interrompe a migração inteira (a exceção propaga e
+        # a transação é revertida por completo, como qualquer outra falha
+        # de migração -- ver run_migrations()).
+        duplicates = conn.execute(text(
+            "SELECT mode, symbols, COUNT(*) AS c FROM operational_sessions "
+            "WHERE ended_at IS NULL AND symbols IS NOT NULL "
+            "GROUP BY mode, symbols HAVING COUNT(*) > 1"
+        )).fetchall()
+        if duplicates:
+            details = "; ".join(f"mode={d[0]!r} symbols={d[1]!r} ({d[2]} sessões ativas)" for d in duplicates)
+            raise MigrationError(
+                "Migração v7 recusada: existem múltiplas sessões operacionais ATIVAS "
+                f"(ended_at IS NULL) para a mesma carteira (mode + symbols): {details}. "
+                "Isso violaria a nova regra de no máximo uma sessão ativa por carteira. "
+                "Nenhuma linha foi apagada ou alterada -- encerre manualmente as sessões "
+                "duplicadas (ver docs/SESSOES_OPERACIONAIS.md) antes de reiniciar a aplicação."
+            )
+        conn.execute(text(
+            "CREATE UNIQUE INDEX uq_operational_session_active_per_portfolio "
+            "ON operational_sessions (mode, symbols) "
+            "WHERE ended_at IS NULL AND symbols IS NOT NULL"
+        ))
+
+    if not _has_unique_partial_index_on(conn, "positions", {"symbol"}):
+        conn.execute(text(
+            "CREATE UNIQUE INDEX uq_position_open_symbol ON positions (symbol) WHERE status = 'OPEN'"
+        ))
+
+
 # Order matters: applied strictly in ascending version order.
 MIGRATIONS: list[tuple[int, str, Callable[[Connection], None]]] = [
     (1, "Adiciona system_state.state_ambiguous, orders.is_close; relaxa orders.stop_loss para opcional.", _migrate_to_v1),
@@ -412,6 +580,10 @@ MIGRATIONS: list[tuple[int, str, Callable[[Connection], None]]] = [
         "checkpoint explícito de cobertura de coleta de funding, nunca derivado do maior occurred_at já "
         "persistido em funding_events.",
      _migrate_to_v6),
+    (7, "Adiciona operational_sessions.symbols (JSON nullable, lista ordenada e canônica -- nunca "
+        "retroativo em linhas legadas) e índice único parcial em positions(symbol) WHERE status='OPEN' -- "
+        "fundação da Fase 3 multiativo.",
+     _migrate_to_v7),
 ]
 
 
@@ -495,6 +667,24 @@ def _v6_invariants_satisfied(conn: Connection) -> bool:
     )
 
 
+def _v7_invariants_satisfied(conn: Connection) -> bool:
+    """ALL structural invariants of v7 -- `symbols` must exist and remain
+    nullable (legacy rows are never backfilled), the CHECK constraint
+    against both `symbol`/`symbols` being NULL simultaneously must exist,
+    the partial unique index enforcing at most one ACTIVE session per
+    portfolio must exist, and the partial unique index on positions must
+    exist (not just any unique index on `symbol`, which would wrongly
+    forbid multiple historical CLOSED positions for the same symbol)."""
+    return (
+        _column_exists(conn, "operational_sessions", "symbols")
+        and _column_is_nullable(conn, "operational_sessions", "symbols")
+        and _column_is_nullable(conn, "operational_sessions", "symbol")
+        and _has_check_constraint(conn, "operational_sessions", _SYMBOL_OR_SYMBOLS_CHECK_SQL)
+        and _has_unique_partial_index_on(conn, "operational_sessions", {"mode", "symbols"})
+        and _has_unique_partial_index_on(conn, "positions", {"symbol"})
+    )
+
+
 _VERSION_INVARIANTS: dict[int, Callable[[Connection], bool]] = {
     1: _v1_invariants_satisfied,
     2: _v2_invariants_satisfied,
@@ -502,6 +692,7 @@ _VERSION_INVARIANTS: dict[int, Callable[[Connection], bool]] = {
     4: _v4_invariants_satisfied,
     5: _v5_invariants_satisfied,
     6: _v6_invariants_satisfied,
+    7: _v7_invariants_satisfied,
 }
 
 

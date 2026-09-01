@@ -413,13 +413,19 @@ def latest_account_snapshot(session: Session) -> AccountSnapshot | None:
     return session.execute(stmt).scalar_one_or_none()
 
 
-def recent_signals(session: Session, limit: int = 50) -> list[StrategySignal]:
+def recent_signals(session: Session, limit: int = 50, symbol: str | None = None) -> list[StrategySignal]:
     stmt = select(StrategySignal).order_by(StrategySignal.created_at.desc()).limit(limit)
+    if symbol is not None:
+        stmt = stmt.where(StrategySignal.symbol == symbol)
     return list(session.execute(stmt).scalars().all())
 
 
-def recent_ai_recommendations(session: Session, limit: int = 50) -> list[AIRecommendation]:
+def recent_ai_recommendations(
+    session: Session, limit: int = 50, symbol: str | None = None
+) -> list[AIRecommendation]:
     stmt = select(AIRecommendation).order_by(AIRecommendation.created_at.desc()).limit(limit)
+    if symbol is not None:
+        stmt = stmt.where(AIRecommendation.symbol == symbol)
     return list(session.execute(stmt).scalars().all())
 
 

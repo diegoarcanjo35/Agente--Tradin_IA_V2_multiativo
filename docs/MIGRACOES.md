@@ -23,8 +23,9 @@ obrigatório (`NOT NULL`), sem índice único em `candles`.
 | `4` | v3 → v4 (correção Fase 2 v1.1) | Adiciona `executions.exchange_fill_id` + índice único `(order_id, exchange_fill_id)` (ledger de fills idempotente, ver `docs/ORDEM_E_FILLS.md`); adiciona `failures_reconciliations.mismatches_json` (resultado estruturado de reconciliação); adiciona `operational_sessions.config_fingerprint` (retomada sensível a mudança de configuração, ver `docs/SESSOES_OPERACIONAIS.md`); cria a tabela `funding_events` + índice único em `funding_id` (coleta idempotente de funding, ver `docs/METRICAS.md`). |
 | `5` | v4 → v5 (correção Fase 2 v1.2) | Adiciona `orders.pending_exchange_status` e `orders.fills_sync_status` (`NOT NULL DEFAULT 'COMPLETE'`) — separa o status que a corretora reportou da comprovação de que o histórico de fills foi sincronizado por completo, para nunca terminalizar uma ordem antes disso (ver `docs/ORDEM_E_FILLS.md`). |
 | `6` | v5 → v6 (correção Fase 2 v1.3) | Cria a tabela `funding_collection_checkpoints` (uma linha por símbolo, índice único em `symbol`) — checkpoint explícito de cobertura de coleta de funding, nunca derivado do maior `occurred_at` já persistido em `funding_events` (ver `docs/METRICAS.md`). |
+| `7` | v6 → v7 (Fase 3 multiativo, fundação + rodada de correção obrigatória do PO) | Adiciona `operational_sessions.symbols` (JSON nullable, lista ordenada e canônica de símbolos — nunca retroativo em linhas legadas, que ficam com `symbols = NULL` como histórico) e relaxa `operational_sessions.symbol` de `NOT NULL` para nullable (uma sessão genuinamente multiativo deixa `symbol` `NULL` em vez de mentir com um único valor — ver `docs/ARQUITETURA.md`, seção "Multiativo"). Adiciona `CHECK (symbol IS NOT NULL OR symbols IS NOT NULL)` — uma linha nunca pode ter os dois nulos simultaneamente. Cria o índice único **parcial** `uq_operational_session_active_per_portfolio` em `(mode, symbols) WHERE ended_at IS NULL AND symbols IS NOT NULL` — no máximo uma sessão ATIVA por carteira (linhas legadas, `symbols IS NULL`, ficam de fora da restrição). Cria o índice único **parcial** `uq_position_open_symbol` em `positions(symbol) WHERE status='OPEN'` — impede duas posições `OPEN` simultâneas para o mesmo símbolo no nível do banco (não afeta múltiplas posições `CLOSED` históricas do mesmo símbolo). Antes de criar o índice de sessão única, a migração verifica se já existem sessões ativas duplicadas para a mesma carteira — se existirem, recusa e para (nunca apaga/corrige dados em silêncio). |
 
-`CURRENT_SCHEMA_VERSION = 6` (constante em `app/persistence/migrations.py`),
+`CURRENT_SCHEMA_VERSION = 7` (constante em `app/persistence/migrations.py`),
 sempre igual à versão da migration mais recente da lista `MIGRATIONS`.
 
 ## Quando as migrations rodam
@@ -118,6 +119,21 @@ coluna sentinela) contra o esquema real:
   existe **e** tem um índice único sobre `symbol` — checado pela estrutura
   do índice, não só a tabela, porque é o índice que garante no máximo um
   checkpoint por símbolo no nível do banco.
+- **v7** (Fase 3 multiativo, fundação + correção obrigatória do PO):
+  `operational_sessions.symbols` existe **e** aceita `NULL`;
+  `operational_sessions.symbol` genuinamente aceita `NULL` (nulabilidade
+  real, não só presença — uma sessão pré-v7 tinha `symbol NOT NULL`); a
+  `CHECK (symbol IS NOT NULL OR symbols IS NOT NULL)` existe — detectada
+  via `sqlite_master.sql` (SQLite não expõe `PRAGMA` para `CHECK`), por
+  correspondência de substring exata do texto que esta própria migração
+  sempre escreve; existe um índice único **parcial**
+  (`WHERE ended_at IS NULL AND symbols IS NOT NULL`) sobre
+  `operational_sessions(mode, symbols)` — no máximo uma sessão ativa por
+  carteira; existe um índice único **parcial** (`WHERE status = 'OPEN'`)
+  sobre `positions(symbol)` — checado distintamente de um índice único
+  comum, porque um índice não-parcial sobre a mesma coluna proibiria
+  erroneamente múltiplas posições `CLOSED` históricas do mesmo símbolo, o
+  que nunca foi a intenção.
 
 ### Cadeia ancestral completa, não só a versão mais alta (correção v1.5 #2)
 

@@ -11,6 +11,7 @@ from app.persistence.db import init_db, make_engine, make_session_factory, sessi
 from app.persistence.models import OperationalSession
 from app.risk.config import RiskLimits
 from app.sessions import _config_fingerprint, start_or_resume_session
+from app.strategy.engine import StrategyConfig
 
 _BASE_LIMITS = RiskLimits(
     max_position_usd=50.0, max_concurrent_positions=1, max_daily_loss_usd=25.0,
@@ -93,20 +94,122 @@ def test_risk_limits_change_ends_old_session_and_starts_a_new_one(tmp_path):
         assert old_row.ended_at is not None
 
 
+# --- Correção obrigatória do PO (Fase 3 multiativo, rodada 2) ---------------
+
+def test_strategy_config_change_ends_old_session_and_starts_a_new_one(tmp_path):
+    """Item 1 da correção: mudar SÓ a configuração da estratégia (não a
+    versão) já deve produzir uma sessão nova -- prova que `strategy_config`
+    entra na composição do fingerprint via `dataclasses.asdict()`."""
+    session_factory = _make_session_factory(tmp_path)
+    settings = _settings()
+
+    with session_scope(session_factory) as session:
+        old = start_or_resume_session(session, settings, "v1", _BASE_LIMITS, StrategyConfig())
+        old_id = old.id
+
+    changed_strategy_config = StrategyConfig(fast_period=12)  # everything else identical
+    with session_scope(session_factory) as session:
+        new = start_or_resume_session(session, settings, "v1", _BASE_LIMITS, changed_strategy_config)
+        assert new.id != old_id
+        assert new.ended_at is None
+
+    with session_scope(session_factory) as session:
+        old_row = session.get(OperationalSession, old_id)
+        assert old_row.ended_at is not None
+        assert old_row.end_reason == "Configuração operacional alterada; sessão substituída."
+
+
+def test_identical_strategy_config_resumes_the_same_session(tmp_path):
+    session_factory = _make_session_factory(tmp_path)
+    settings = _settings()
+
+    with session_scope(session_factory) as session:
+        first = start_or_resume_session(session, settings, "v1", _BASE_LIMITS, StrategyConfig())
+        first_id = first.id
+
+    with session_scope(session_factory) as session:
+        second = start_or_resume_session(session, settings, "v1", _BASE_LIMITS, StrategyConfig())
+        assert second.id == first_id
+        assert second.ended_at is None
+
+
+def test_partial_fill_policy_change_ends_old_session_and_starts_a_new_one(tmp_path):
+    """Item 2 da correção: partial_fill_policy altera execução -- deve
+    entrar no fingerprint."""
+    session_factory = _make_session_factory(tmp_path)
+    settings_wait = _settings(partial_fill_policy="WAIT")
+    settings_cancel = _settings(partial_fill_policy="CANCEL_REMAINDER")
+
+    with session_scope(session_factory) as session:
+        old = start_or_resume_session(session, settings_wait, "v1", _BASE_LIMITS)
+        old_id = old.id
+
+    with session_scope(session_factory) as session:
+        new = start_or_resume_session(session, settings_cancel, "v1", _BASE_LIMITS)
+        assert new.id != old_id
+
+
+def test_paper_live_fee_and_slippage_change_ends_old_session_and_starts_a_new_one(tmp_path):
+    """Item 2 da correção: fee_rate/slippage_bps alteram o resultado
+    financeiro simulado -- devem entrar no fingerprint."""
+    session_factory = _make_session_factory(tmp_path)
+    settings_a = _settings(paper_live_fee_rate=0.0006, paper_live_slippage_bps=5.0)
+    settings_b = _settings(paper_live_fee_rate=0.001, paper_live_slippage_bps=5.0)
+
+    with session_scope(session_factory) as session:
+        old = start_or_resume_session(session, settings_a, "v1", _BASE_LIMITS)
+        old_id = old.id
+
+    with session_scope(session_factory) as session:
+        new = start_or_resume_session(session, settings_b, "v1", _BASE_LIMITS)
+        assert new.id != old_id
+
+
+def test_poll_interval_change_alone_never_creates_a_new_session(tmp_path):
+    """Decisão do PO: cadência de polling é puramente de agendamento --
+    nunca deve, sozinha, forçar uma nova sessão."""
+    session_factory = _make_session_factory(tmp_path)
+    settings_a = _settings(bybit_poll_interval_seconds=5.0)
+    settings_b = _settings(bybit_poll_interval_seconds=30.0)
+
+    with session_scope(session_factory) as session:
+        old = start_or_resume_session(session, settings_a, "v1", _BASE_LIMITS)
+        old_id = old.id
+
+    with session_scope(session_factory) as session:
+        resumed = start_or_resume_session(session, settings_b, "v1", _BASE_LIMITS)
+        assert resumed.id == old_id  # same session -- polling cadence is not part of identity
+
+
+def test_market_data_initial_start_only_fingerprinted_when_mode_uses_it():
+    """Decisão do PO: market_data_initial_start só entra no fingerprint
+    quando o modo realmente o usa (PAPER_LIVE/BYBIT_DEMO) -- REPLAY o
+    ignora por completo (ReplayMarketDataProvider nunca lê esse campo)."""
+    from datetime import datetime, timezone
+
+    settings_replay_a = _settings(mode=RunMode.REPLAY)
+    settings_replay_b = _settings(
+        mode=RunMode.REPLAY, market_data_initial_start=datetime(2024, 6, 1, tzinfo=timezone.utc),
+    )
+    fp_replay_a = _config_fingerprint(settings_replay_a, "v1", _BASE_LIMITS, StrategyConfig())
+    fp_replay_b = _config_fingerprint(settings_replay_b, "v1", _BASE_LIMITS, StrategyConfig())
+    assert fp_replay_a == fp_replay_b  # REPLAY ignores it -- must not affect identity
+
+
 def test_timeframe_component_of_the_fingerprint_differs_when_declared_differently():
     """The fingerprint is sensitive to the timeframe component even though
     every current caller passes the same literal "1" -- proven directly at
     the fingerprint-function level rather than needing a second timeframe
     plumbed all the way through Settings."""
     settings = _settings()
-    fp_a = _config_fingerprint(settings, "v1", _BASE_LIMITS)
+    fp_a = _config_fingerprint(settings, "v1", _BASE_LIMITS, StrategyConfig())
 
     import app.sessions as sessions_module
 
     real_snapshot_fn = sessions_module._sanitized_config_snapshot
     try:
         sessions_module._sanitized_config_snapshot = lambda s: {**real_snapshot_fn(s), "_tf_marker": "5"}
-        fp_b = sessions_module._config_fingerprint(settings, "v1", _BASE_LIMITS)
+        fp_b = sessions_module._config_fingerprint(settings, "v1", _BASE_LIMITS, StrategyConfig())
     finally:
         sessions_module._sanitized_config_snapshot = real_snapshot_fn
 
@@ -138,7 +241,7 @@ def test_fingerprint_and_snapshot_never_contain_bybit_credentials():
         mode=RunMode.BYBIT_DEMO, bybit_api_key="super-secret-key", bybit_api_secret="super-secret-secret",
         bybit_base_url="https://api-demo.bybit.com", bybit_ws_url="wss://stream-demo.bybit.com",
     )
-    fingerprint = _config_fingerprint(settings, "v1", _BASE_LIMITS)
+    fingerprint = _config_fingerprint(settings, "v1", _BASE_LIMITS, StrategyConfig())
     assert "super-secret-key" not in fingerprint
     assert "super-secret-secret" not in fingerprint
 
