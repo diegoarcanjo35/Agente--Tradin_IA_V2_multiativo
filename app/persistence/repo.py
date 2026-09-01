@@ -17,9 +17,11 @@ from app.persistence.models import (
     AccountSnapshot,
     AIRecommendation,
     Candle,
+    Execution,
     FailureReconciliation,
     FundingCollectionCheckpoint,
     FundingEvent,
+    OperationalSession,
     Order,
     OrderEvent,
     Position,
@@ -37,6 +39,25 @@ def get_or_create_system_state(session: Session) -> SystemState:
         session.add(state)
         session.flush()
     return state
+
+
+def get_active_session(session: Session, state: SystemState) -> OperationalSession | None:
+    """Fase 3.1.1 (correção final da auditoria do PO, item 2): fonte
+    ÚNICA e pública para obter a sessão operacional ativa -- `active_session_id`
+    vive em `SystemState`, uma linha ÚNICA e global (nunca por símbolo,
+    nunca por instância de orquestrador -- ver `repo.get_or_create_system_state`),
+    então esta função nunca precisou de nenhum estado de instância de
+    `Orchestrator`/`MultiSymbolOrchestrator` para funcionar. Substitui o
+    antigo `Orchestrator._active_session` (método privado, existia só em
+    `Orchestrator`, nunca em `MultiSymbolOrchestrator` -- causa exata do
+    `AttributeError` em `POST /kill-switch/engage` sob multiativo) como a
+    interface pública comum entre rotas HTTP e ambos os tipos de
+    orquestrador. Retorna `None` se nenhuma sessão está ativa ainda (ex.:
+    um `Orchestrator` de teste construído sem passar por
+    `app.api.main.build_orchestrator`)."""
+    if state.active_session_id is None:
+        return None
+    return session.get(OperationalSession, state.active_session_id)
 
 
 def recompute_trading_blocked(state: SystemState, max_api_failures: int) -> None:
@@ -239,6 +260,93 @@ def filled_orders(session: Session, symbol: str | None = None) -> list[Order]:
     return list(session.execute(stmt).scalars().all())
 
 
+def execution_fees(session: Session, symbol: str | None = None, since: datetime | None = None) -> float:
+    """Fase 3.1.1 (correção final da auditoria do PO, item 1): fonte
+    CANÔNICA de taxas para o cálculo de equity -- soma `Execution.fee`
+    diretamente, uma linha por fill REALMENTE ocorrido (deduplicado por
+    `UniqueConstraint(order_id, exchange_fill_id)` -- nunca um fill
+    duplicado, nunca uma ordem rejeitada/sem fill, que nunca ganha uma
+    linha `Execution`).
+
+    Por que não `Position.fees_paid` nem `Order.fees_total`: ambos são
+    agregados DERIVADOS. `Position.fees_paid` só é incrementado quando um
+    fill é efetivamente APLICADO a uma posição -- um fill bloqueado por
+    segurança (`LATE_OPPOSITE_FILL_BLOCKED`, side oposto ao da posição
+    aberta) ou um fill de fechamento que chega sem nenhuma posição local
+    (`position is None` em `app/execution/fill_service.py`) tem uma taxa
+    real (linha `Execution` real) que nunca chega a incrementar nenhum
+    `Position.fees_paid` -- a taxa "some" da equity se essa for a única
+    fonte somada. `Order.fees_total` é recalculado do zero a cada fill a
+    partir do MESMO conjunto de linhas `Execution` (ver
+    `app/execution/fill_ledger.py::record_new_fills`) -- somar
+    `Order.fees_total` E `Position.fees_paid` juntos duplicaria toda taxa
+    normal (a mesma taxa apareceria nas duas fontes).
+
+    `Execution.fee` é a única fonte que nunca duplica (cada linha
+    representa exatamente um fill real, uma única vez) e nunca omite
+    (inclui até os fills bloqueados/órfãos, cuja taxa foi genuinamente
+    incorrida pela execução simulada). `since` filtra por
+    `Execution.executed_at` -- o instante real em que o fill (e sua taxa)
+    ocorreu, nunca a data de abertura/fechamento da posição que porventura
+    o recebeu (ou não)."""
+    stmt = select(Execution.fee).join(Order, Execution.order_id == Order.id)
+    if symbol is not None:
+        stmt = stmt.where(Order.symbol == symbol)
+    if since is not None:
+        stmt = stmt.where(Execution.executed_at >= since)
+    return sum(session.execute(stmt).scalars().all())
+
+
+def execution_fills_count(session: Session, symbol: str | None = None, since: datetime | None = None) -> int:
+    """Fase 3.1.1 (correção final da auditoria do PO, item 2): quantidade
+    de fills reais no período -- mesma fonte/filtro de `execution_fees`,
+    para o bloco `period_performance` expor "quantidade de fills"
+    explicitamente."""
+    stmt = select(Execution.id).join(Order, Execution.order_id == Order.id)
+    if symbol is not None:
+        stmt = stmt.where(Order.symbol == symbol)
+    if since is not None:
+        stmt = stmt.where(Execution.executed_at >= since)
+    return len(session.execute(stmt).scalars().all())
+
+
+def orders_with_executions_since(
+    session: Session, symbol: str | None = None, since: datetime | None = None,
+) -> list[tuple[Order, list[Execution]]]:
+    """Fase 3.1.1 (último gate contábil da auditoria do PO): fonte para
+    `/api/costs`, ESCOPADA pela base contábil ativa -- nunca
+    `repo.filled_orders` (que retornava toda ordem FILLED/PARTIALLY_FILLED
+    de qualquer época, e usava `Order.avg_fill_price`/`filled_qty`
+    agregados por TODOS os fills da ordem, mesmo os de antes de um
+    reset).
+
+    Retorna uma lista de `(Order, [Execution, ...])` -- só os `Execution`
+    cujo `executed_at >= since` (quando dado), agrupados por ordem. Uma
+    ordem com ZERO fills no recorte simplesmente não aparece (nunca uma
+    entrada "fantasma"). Uma ordem cujos fills estão PARCIALMENTE do outro
+    lado da fronteira (alguns antes, alguns depois de `since`) aparece
+    apenas com os fills POSTERIORES -- o chamador deve recalcular
+    `avg_fill_price`/`filled_qty` a partir APENAS dessas linhas, nunca
+    reaproveitar `Order.avg_fill_price`/`Order.filled_qty` (que agregam
+    TODOS os fills da ordem, de qualquer época)."""
+    stmt = (
+        select(Execution, Order)
+        .join(Order, Execution.order_id == Order.id)
+        .order_by(Order.id, Execution.id)
+    )
+    if symbol is not None:
+        stmt = stmt.where(Order.symbol == symbol)
+    if since is not None:
+        stmt = stmt.where(Execution.executed_at >= since)
+
+    by_order: dict[int, tuple[Order, list[Execution]]] = {}
+    for execution, order in session.execute(stmt).all():
+        if order.id not in by_order:
+            by_order[order.id] = (order, [])
+        by_order[order.id][1].append(execution)
+    return list(by_order.values())
+
+
 def has_unknown_orders(session: Session) -> bool:
     """Fase 2, item 7.2/7.5: whether any order currently sits in UNKNOWN --
     the SystemState.order_state_unknown block-cause flag is always
@@ -338,10 +446,18 @@ def open_positions(session: Session, symbol: str | None = None) -> list[Position
     return list(session.execute(stmt).scalars().all())
 
 
-def closed_positions(session: Session, symbol: str | None = None) -> list[Position]:
+def closed_positions(
+    session: Session, symbol: str | None = None, since: datetime | None = None,
+) -> list[Position]:
+    """Fase 3.1.1: `since`, when given, keeps only trades that CLOSED at or
+    after that instant -- the scope window (`session`/`daily`) for
+    performance metrics and equity. `None` (default) is the unfiltered
+    lifetime view, unchanged from before this parameter existed."""
     stmt = select(Position).where(Position.status == "CLOSED").order_by(Position.closed_at)
     if symbol:
         stmt = stmt.where(Position.symbol == symbol)
+    if since is not None:
+        stmt = stmt.where(Position.closed_at >= since)
     return list(session.execute(stmt).scalars().all())
 
 
@@ -364,15 +480,37 @@ def last_funding_occurred_at(session: Session, symbol: str) -> datetime | None:
     return row
 
 
-def funding_total(session: Session, symbol: str | None = None) -> float:
+def funding_total(session: Session, symbol: str | None = None, since: datetime | None = None) -> float:
     """Correção v1.1 #6: the real SUM of collected funding -- 0.0 is a
     genuine, correct total when no funding has settled yet (never confused
     with UNAVAILABLE, which app.metrics.engine reports only when there is
-    no funding_provider at all to have collected anything with)."""
+    no funding_provider at all to have collected anything with). Fase
+    3.1.1: `since`, when given, keeps only events that occurred at or
+    after that instant (scope window)."""
     stmt = select(FundingEvent.amount)
     if symbol:
         stmt = stmt.where(FundingEvent.symbol == symbol)
+    if since is not None:
+        stmt = stmt.where(FundingEvent.occurred_at >= since)
     return sum(session.execute(stmt).scalars().all())
+
+
+def funding_paid_received(
+    session: Session, symbol: str | None = None, since: datetime | None = None,
+) -> tuple[float, float]:
+    """Fase 3.1.1 (correção final da auditoria do PO, item 7): funding
+    pago e recebido SEPARADOS -- nunca apresentar funding recebido como um
+    custo negativo sem explicação. `FundingEvent.amount` já é assinado
+    (positivo = creditado, negativo = debitado -- ver models.py)."""
+    stmt = select(FundingEvent.amount)
+    if symbol:
+        stmt = stmt.where(FundingEvent.symbol == symbol)
+    if since is not None:
+        stmt = stmt.where(FundingEvent.occurred_at >= since)
+    amounts = session.execute(stmt).scalars().all()
+    received = sum(a for a in amounts if a > 0)
+    paid = -sum(a for a in amounts if a < 0)
+    return paid, received
 
 
 def get_funding_checkpoint(session: Session, symbol: str) -> FundingCollectionCheckpoint | None:

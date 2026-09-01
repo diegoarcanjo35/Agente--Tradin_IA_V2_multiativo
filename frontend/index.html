@@ -12,12 +12,13 @@
   <header class="topbar">
     <h1>Agente de Trading IA — Fase 2</h1>
     <div class="status-chips">
+      <span id="chip-op-state" class="chip chip-primary">ESTADO OPERACIONAL: --</span>
       <span id="chip-mode" class="chip">MODO: --</span>
       <span id="chip-conn" class="chip">CONEXÃO: --</span>
       <span id="chip-trading" class="chip">OPERAÇÕES: --</span>
       <span id="chip-kill" class="chip">BLOQUEIO DE EMERGÊNCIA: --</span>
-      <span id="chip-op-state" class="chip">ESTADO OPERACIONAL: --</span>
     </div>
+    <div id="block-reason-line" class="block-reason-line" hidden></div>
     <button id="btn-kill" class="btn-danger">Ativar bloqueio de emergência</button>
     <button id="btn-unkill" class="btn-secondary">Desativar bloqueio de emergência</button>
     <button id="btn-activate" class="btn-secondary">Ativar novas entradas</button>
@@ -26,24 +27,16 @@
   <div id="status-message" class="status-message"></div>
 
   <main>
-    <section class="grid-2">
-      <div class="card">
-        <h2>Estado Operacional e Causas de Bloqueio</h2>
-        <div id="block-causes-box">Carregando...</div>
+    <!-- B. Resumo financeiro principal -->
+    <section class="card hero-card">
+      <div class="hero-header">
+        <h2>Patrimônio</h2>
+        <span id="equity-scope-badge" class="chip chip-scope">escopo: --</span>
       </div>
-      <div class="card">
-        <h2>Sessão Atual</h2>
-        <div id="session-box">Carregando...</div>
+      <div id="equity-incomplete-notice" class="notice-amber" hidden>
+        Patrimônio incompleto: pelo menos uma posição aberta não pôde ser marcada a mercado agora.
       </div>
-      <div class="card">
-        <h2>Motor de Mercado (Heartbeat)</h2>
-        <div id="poll-health-box">Carregando...</div>
-      </div>
-    </section>
-
-    <section class="card">
-      <h2>Resumo por Símbolo (Carteira Multiativo)</h2>
-      <div id="symbols-summary-box">Carregando...</div>
+      <div id="hero-grid" class="hero-grid">Carregando...</div>
     </section>
 
     <section class="card" id="chart-card">
@@ -74,28 +67,45 @@
       </p>
     </section>
 
-    <section class="grid">
-      <div class="card">
-        <h2>Saldo &amp; Patrimônio (Equity)</h2>
-        <div id="account-box">Carregando...</div>
-      </div>
-      <div class="card">
-        <h2>Lucro &amp; Prejuízo (P&amp;L)</h2>
-        <div id="pnl-box">Carregando...</div>
-      </div>
-      <div class="card">
-        <h2>Métricas</h2>
-        <div id="metrics-box">Carregando...</div>
-      </div>
-      <div class="card">
-        <h2>Rebaixamento (Drawdown) / Fator de Lucro</h2>
-        <div id="risk-metrics-box">Carregando...</div>
+    <!-- D. Resumo por Símbolo -->
+    <section class="card">
+      <h2>Resumo por Símbolo (Carteira Multiativo)</h2>
+      <div class="table-scroll">
+        <table id="symbols-summary-table">
+          <thead><tr>
+            <th>Símbolo</th><th>Saúde</th><th>Preço</th><th>Posição</th>
+            <th>Exposição</th><th>Realizado</th><th>Não realizado</th><th>Último sinal</th>
+          </tr></thead>
+          <tbody></tbody>
+        </table>
       </div>
     </section>
 
+    <!-- E. Desempenho -->
     <section class="card">
-      <h2>Curva de Patrimônio (Equity)</h2>
+      <h2>Desempenho</h2>
+      <div id="performance-grid" class="hero-grid hero-grid-compact">Carregando...</div>
+    </section>
+
+    <section class="card">
+      <h2>Curva de Patrimônio Realizado (Equity)</h2>
+      <p class="card-subtitle">Apenas operações fechadas -- não inclui P&amp;L não realizado de posições abertas.</p>
       <canvas id="equity-canvas" width="900" height="220"></canvas>
+    </section>
+
+    <!-- F. Custos de negociação -->
+    <section class="card">
+      <h2>Impacto dos Custos de Negociação</h2>
+      <p class="notice-muted">
+        Taxas e slippage já estão refletidos no resultado líquido e não são descontados novamente do patrimônio.
+      </p>
+      <div id="costs-box" class="hero-grid hero-grid-compact">Carregando...</div>
+      <div class="table-scroll">
+        <table id="costs-by-symbol-table">
+          <thead><tr><th>Símbolo</th><th>Ordens</th><th>Taxas</th><th>Slippage adverso</th><th>Melhoria</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
     </section>
 
     <section class="grid-2">
@@ -115,26 +125,38 @@
         <table id="orders-table"><thead><tr><th>Hora</th><th>Símbolo</th><th>Lado</th><th>Status</th><th>Qtd Preenchida</th><th>Preço Médio</th></tr></thead><tbody></tbody></table>
       </div>
       <div class="card">
-        <h2>Custos e Slippage</h2>
-        <div id="costs-box">Carregando...</div>
-      </div>
-    </section>
-
-    <section class="grid-2">
-      <div class="card">
         <h2>Decisões do Motor de Risco (Risk Engine)</h2>
         <table id="risk-table"><thead><tr><th>Hora</th><th>Situação</th><th>Motivo</th></tr></thead><tbody></tbody></table>
-      </div>
-      <div class="card">
-        <h2>IA em Modo de Observação (Shadow Mode) — nunca executa ordens</h2>
-        <table id="ai-table"><thead><tr><th>Hora</th><th>Símbolo</th><th>Recomendação</th><th>Confiança</th><th>Resumo</th></tr></thead><tbody></tbody></table>
       </div>
     </section>
 
     <section class="card">
-      <h2>Histórico de Erros</h2>
-      <table id="failures-table"><thead><tr><th>Hora</th><th>Tipo</th><th>Detalhe</th></tr></thead><tbody></tbody></table>
+      <h2>IA em Modo de Observação (Shadow Mode) — nunca executa ordens</h2>
+      <table id="ai-table"><thead><tr><th>Hora</th><th>Símbolo</th><th>Recomendação</th><th>Confiança</th><th>Resumo</th></tr></thead><tbody></tbody></table>
     </section>
+
+    <!-- G. Diagnóstico técnico -->
+    <details class="card diagnostics">
+      <summary>Diagnóstico técnico (sessão, heartbeat, reconciliação, erros)</summary>
+      <section class="grid-2">
+        <div class="card card-flat">
+          <h2>Estado Operacional e Causas de Bloqueio</h2>
+          <div id="block-causes-box">Carregando...</div>
+        </div>
+        <div class="card card-flat">
+          <h2>Sessão Atual</h2>
+          <div id="session-box">Carregando...</div>
+        </div>
+        <div class="card card-flat">
+          <h2>Motor de Mercado (Heartbeat)</h2>
+          <div id="poll-health-box">Carregando...</div>
+        </div>
+      </section>
+      <div class="card card-flat">
+        <h2>Histórico de Erros</h2>
+        <table id="failures-table"><thead><tr><th>Hora</th><th>Tipo</th><th>Detalhe</th></tr></thead><tbody></tbody></table>
+      </div>
+    </details>
 
     <footer>
       <span>Última atualização: <span id="last-updated">--</span></span>

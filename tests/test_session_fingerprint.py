@@ -165,6 +165,60 @@ def test_paper_live_fee_and_slippage_change_ends_old_session_and_starts_a_new_on
         assert new.id != old_id
 
 
+# --- Fase 3.1.1 (correção final da auditoria do PO): saldo inicial PAPER ---
+
+def test_starting_balance_change_ends_old_session_and_starts_a_new_one(tmp_path):
+    """Item 1 da decisão do PO: alterar `paper_starting_balance_usd` gera
+    uma sessão operacional nova (é uma mudança de configuração como
+    qualquer outra que afete o resultado financeiro), mas NUNCA reescreve
+    a sessão antiga."""
+    session_factory = _make_session_factory(tmp_path)
+    settings_a = _settings(paper_starting_balance_usd=1000.0)
+    settings_b = _settings(paper_starting_balance_usd=5000.0)
+
+    with session_scope(session_factory) as session:
+        old = start_or_resume_session(session, settings_a, "v1", _BASE_LIMITS)
+        old_id = old.id
+
+    with session_scope(session_factory) as session:
+        new = start_or_resume_session(session, settings_b, "v1", _BASE_LIMITS)
+        assert new.id != old_id
+        assert new.ended_at is None
+
+    with session_scope(session_factory) as session:
+        old_row = session.get(OperationalSession, old_id)
+        assert old_row.ended_at is not None
+        assert old_row.risk_config_json is not None  # linha antiga preservada intacta, nunca reescrita
+
+
+def test_starting_balance_is_frozen_in_the_new_sessions_config_snapshot(tmp_path):
+    """O valor usado fica congelado no `config_snapshot_json` da sessão --
+    auditável mesmo se `Settings` mudar depois."""
+    import json as json_module
+
+    session_factory = _make_session_factory(tmp_path)
+    settings = _settings(paper_starting_balance_usd=2500.0)
+
+    with session_scope(session_factory) as session:
+        op_session = start_or_resume_session(session, settings, "v1", _BASE_LIMITS)
+        snapshot = json_module.loads(op_session.config_snapshot_json)
+        assert snapshot["paper_starting_balance_usd"] == 2500.0
+
+
+def test_identical_starting_balance_resumes_the_same_session(tmp_path):
+    session_factory = _make_session_factory(tmp_path)
+    settings = _settings(paper_starting_balance_usd=1000.0)
+
+    with session_scope(session_factory) as session:
+        first = start_or_resume_session(session, settings, "v1", _BASE_LIMITS)
+        first_id = first.id
+
+    with session_scope(session_factory) as session:
+        second = start_or_resume_session(session, settings, "v1", _BASE_LIMITS)
+        assert second.id == first_id
+        assert second.ended_at is None
+
+
 def test_poll_interval_change_alone_never_creates_a_new_session(tmp_path):
     """Decisão do PO: cadência de polling é puramente de agendamento --
     nunca deve, sozinha, forçar uma nova sessão."""

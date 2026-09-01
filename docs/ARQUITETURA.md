@@ -202,3 +202,11 @@ Ver `docs/PAINEL_GRAFICO.md` para o desenho completo: rota somente-leitura
 fechado, TradingView Lightweight Charts vendorizado localmente (ver
 `THIRD_PARTY_NOTICES.md`), e isolamento multiativo do gráfico (troca de
 símbolo nunca mistura estado).
+
+## Painel financeiro (Fase 3.1.1)
+
+Ver `docs/PAINEL_FINANCEIRO.md` para o desenho completo: fórmula oficial
+de patrimônio (equity), escopos (`lifetime`/`session`/`daily`), marcação a
+mercado de posições abertas, contrato definitivo de slippage (impacto
+financeiro real, nunca a diferença unitária de preço sozinha), e prevenção
+de dupla contagem entre taxas/slippage/funding/P&amp;L.

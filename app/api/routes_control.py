@@ -103,7 +103,14 @@ def engage_kill_switch(request: Request):
             session, "KILL_SWITCH_ENGAGED", "Ativação manual do bloqueio de emergência pelo painel."
         )
 
-        op_session = orch._active_session(session, state)
+        # Fase 3.1.1 (correção final da auditoria do PO, item 2): interface
+        # pública comum -- funciona tanto para `Orchestrator` (monoativo)
+        # quanto para `MultiSymbolOrchestrator` (multiativo), que nunca
+        # teve o antigo `orch._active_session` privado. `active_session_id`
+        # é uma única sessão de carteira, global (ver `SystemState`),
+        # nunca por símbolo -- nenhuma diferença de comportamento entre os
+        # dois tipos de orquestrador aqui.
+        op_session = repo.get_active_session(session, state)
         cancelled_order_ids: list[int] = []
         for order in repo.non_terminal_orders(session, mode=orch.settings.mode.value):
             if not order.exchange_order_id:

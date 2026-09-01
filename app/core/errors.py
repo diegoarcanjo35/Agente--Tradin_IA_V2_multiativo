@@ -60,3 +60,16 @@ class InvalidAIOutputError(TradingSystemError):
 
 class SecretLeakError(TradingSystemError):
     """Raised defensively if code path would emit a secret into logs or persistence."""
+
+
+class StartingBalanceResetBlockedError(TradingSystemError):
+    """Fase 3.1.1 (correção final da auditoria do PO, item 5): raised at
+    startup when `Settings.paper_starting_balance_usd` differs from the
+    value frozen in the previous operational session's snapshot AND at
+    least one position is currently open. There is no capital
+    deposit/withdrawal ledger in this system -- changing the starting
+    balance is only a safe "reset the simulated wallet" operation when no
+    open position exists to be silently re-based onto the new anchor.
+    Refusing to start (rather than starting in a financially ambiguous
+    state) matches this codebase's existing policy for unsafe startup
+    conditions (see ProductionEndpointBlockedError, MigrationError)."""

@@ -1,16 +1,30 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 
 from fastapi import APIRouter, HTTPException, Request
 
 from app.core.config import RunMode
-from app.metrics.engine import ClosedTrade, OrderFillView, compute_cost_metrics, compute_metrics
+from app.metrics.engine import (
+    UNAVAILABLE,
+    ClosedTrade,
+    OrderFillView,
+    PositionMarkView,
+    compute_cost_metrics,
+    compute_equity,
+    compute_metrics,
+    compute_period_performance,
+    compute_unrealized_pnl,
+)
 from app.persistence import repo
 from app.persistence.db import session_scope
 from app.persistence.models import OperationalSession
+from app.sessions import resolve_accounting_base, resolve_starting_balance
 
 router = APIRouter()
+
+_VALID_SCOPES = ("lifetime", "session", "daily")
 
 # Fase 2, item 7.1: PAPER_LIVE gets its own explicit banner -- it uses REAL
 # market data, unlike REPLAY/PAPER_LOCAL, so the generic "AMBIENTE DEMO" text
@@ -46,6 +60,59 @@ def _configured_symbols(orch) -> list[str]:
     """Fase 3 multiativo: works for both a plain `Orchestrator` (monoativo)
     and a `MultiSymbolOrchestrator` -- both expose `.settings.symbols`."""
     return list(orch.settings.symbols)
+
+
+def _resolve_mark_price(orch, session, symbol: str, timeframe: str = "1m", candles=None):
+    """Fase 3.1.1: fonte única de marcação a mercado, compartilhada entre
+    `/api/chart-data` e `/api/portfolio-summary` -- nunca duas
+    implementações divergentes do mesmo conceito. Mesma prioridade
+    honesta de sempre: preço visual (candle em formação, quando o
+    provider expõe um) -> fechamento do último candle persistido -> nada
+    (nunca finge um preço). `candles`, quando já carregado pelo chamador
+    (ex.: chart-data já buscou a janela pedida), evita uma segunda
+    consulta -- passe `None` para que esta função busque só 1 linha."""
+    visual = getattr(orch, "visual_price_state", {}).get(symbol)
+    if visual is not None:
+        return visual["price"], "forming_candle", visual["at"].isoformat()
+    if candles is None:
+        candles = repo.recent_candles(session, symbol, timeframe, limit=1)
+    if candles:
+        last = candles[-1]
+        return last.close, "last_closed_candle", last.open_time.isoformat()
+    return None, None, None
+
+
+def _scope_since(scope: str, session_started_at: datetime | None, base_started_at: datetime | None) -> datetime | None:
+    """Fase 3.1.1 (último gate contábil da auditoria do PO): traduz o
+    `scope` pedido num corte de tempo para filtrar POSIÇÕES FECHADAS e
+    FUNDING -- nunca para posições abertas (seu estado atual sempre
+    participa integralmente; ver docs/PAINEL_FINANCEIRO.md, seção
+    "Escopos"). SEMPRE limitado (nunca antes) pelo início da BASE
+    CONTÁBIL atual (`app.sessions.resolve_accounting_base`) -- nenhum
+    escopo, nem mesmo `lifetime`, pode alcançar dados de uma base contábil
+    anterior a um reset de `paper_starting_balance_usd`.
+
+    - `lifetime`: "desde o início da base contábil ATUAL" -- NUNCA "todo o
+      histórico do banco" quando já existiu um reset (ver
+      `resolve_accounting_base`). Sem nenhuma base resolvida (nenhuma
+      sessão ativa ainda), continua sem corte algum.
+    - `session`: desde o início da sessão operacional ativa (`started_at`)
+      -- já é, por construção, `>= base_started_at` (a base nunca começa
+      DEPOIS da sessão que a define).
+    - `daily`: desde 00:00 UTC do dia corrente -- filtro real de UTC.
+    """
+    if scope == "session":
+        candidate = session_started_at
+    elif scope == "daily":
+        candidate = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+    else:  # "lifetime"
+        candidate = None
+
+    if base_started_at is None:
+        return candidate
+    if candidate is None:
+        return base_started_at
+    return max(candidate, base_started_at)
 
 
 def _symbols_health_dict(request: Request, orch) -> dict:
@@ -204,26 +271,58 @@ def get_orders(request: Request, limit: int = 50, symbol: str | None = None):
 
 
 @router.get("/costs")
-def get_costs(request: Request):
-    """Fase 2, item 7.6/7.9: fees accumulated and realized slippage vs. the
-    reference price -- never a fabricated zero when unknown."""
+def get_costs(request: Request, symbol: str | None = None):
+    """Fase 2, item 7.6/7.9; contrato definitivo do último gate contábil
+    da auditoria do PO (Fase 3.1.1): fees acumuladas e o impacto
+    financeiro REAL do slippage (já multiplicado por `filled_qty`, nunca a
+    diferença unitária de preço sozinha) -- nunca um zero fabricado quando
+    desconhecido. `?symbol=` opcional filtra para um único símbolo, nunca
+    misturando notionais de ativos diferentes na mesma soma quando usado.
+
+    ESCOPADO PELA BASE CONTÁBIL ATIVA por padrão -- mesma resolução de
+    `/api/portfolio-summary` (`app.sessions.resolve_accounting_base`).
+    Nunca soma custos de uma base anterior a um reset de
+    `paper_starting_balance_usd` junto com o patrimônio/P&L da base
+    atual (misturaria universos financeiros diferentes, exatamente o
+    problema que motivou este gate). Fonte: `repo.orders_with_executions_since`
+    -- para cada ordem, `avg_fill_price`/`filled_qty` são RECALCULADOS a
+    partir apenas dos fills (`Execution` rows) cujo `executed_at` cai na
+    base ativa -- NUNCA reaproveita `Order.avg_fill_price`/`filled_qty`
+    (que agregam TODOS os fills da ordem, de qualquer época -- misturaria
+    fills de antes e depois de um reset numa ordem que porventura tenha
+    ambos)."""
     orch = request.app.state.orchestrator
     with session_scope(orch.session_factory) as session:
-        orders = repo.filled_orders(session)
-        views = [
-            OrderFillView(
-                side=o.side, reference_price=o.reference_price,
-                avg_fill_price=o.avg_fill_price, fees_total=o.fees_total,
-            )
-            for o in orders
-        ]
+        state = repo.get_or_create_system_state(session)
+        active_session = repo.get_active_session(session, state)
+        base_started_at, _base_session = resolve_accounting_base(session, active_session)
+
+        views = []
+        for order, executions in repo.orders_with_executions_since(session, symbol, since=base_started_at):
+            total_qty = sum(e.fill_qty for e in executions)
+            if total_qty <= 0:
+                continue
+            avg_price = sum(e.fill_qty * e.fill_price for e in executions) / total_qty
+            fees_total = sum(e.fee for e in executions)
+            views.append(OrderFillView(
+                side=order.side, reference_price=order.reference_price,
+                avg_fill_price=avg_price, filled_qty=total_qty, fees_total=fees_total,
+            ))
+
         result = compute_cost_metrics(views)
-        return result.__dict__
+        payload = result.__dict__.copy()
+        payload["accounting_base_started_at"] = base_started_at.isoformat() if base_started_at is not None else None
+        return payload
 
 
-def _metrics_for_trades(trades: list[ClosedTrade], open_exposure_usd: float, funding_total: float | None) -> dict:
+def _metrics_for_trades(
+    orch, trades: list[ClosedTrade], open_exposure_usd: float, funding_total: float | None,
+) -> dict:
+    # Fase 3.1.1: única fonte do saldo inicial -- Settings.paper_starting_balance_usd
+    # (nunca mais um literal solto aqui; ver docs/PAINEL_FINANCEIRO.md).
     result = compute_metrics(
-        trades, starting_balance=1000.0, open_exposure_usd=open_exposure_usd, funding_total=funding_total,
+        trades, starting_balance=orch.settings.paper_starting_balance_usd,
+        open_exposure_usd=open_exposure_usd, funding_total=funding_total,
     )
     return result.__dict__
 
@@ -259,7 +358,7 @@ def get_metrics(request: Request):
             sum(repo.funding_total(session, s) for s in _configured_symbols(orch))
             if orch.funding_provider is not None else None
         )
-        result = _metrics_for_trades(trades, open_exposure, funding)
+        result = _metrics_for_trades(orch, trades, open_exposure, funding)
 
         per_symbol = {}
         for symbol in _configured_symbols(orch):
@@ -277,10 +376,220 @@ def get_metrics(request: Request):
             symbol_funding = (
                 repo.funding_total(session, symbol) if orch.funding_provider is not None else None
             )
-            per_symbol[symbol] = _metrics_for_trades(symbol_trades, symbol_exposure, symbol_funding)
+            per_symbol[symbol] = _metrics_for_trades(orch, symbol_trades, symbol_exposure, symbol_funding)
 
         result["per_symbol"] = per_symbol
         return result
+
+
+def _funding_for_symbols(orch, session, symbols, since):
+    if orch.funding_provider is None:
+        return None, None
+    paid, received = 0.0, 0.0
+    for s in symbols:
+        p, r = repo.funding_paid_received(session, s, since=since)
+        paid += p
+        received += r
+    return paid, received
+
+
+def _portfolio_state(orch, session, symbol: str | None, base_started_at):
+    """Fase 3.1.1 (último gate contábil da auditoria do PO): componentes
+    do bloco `portfolio` -- "equity não tem escopo" continua valendo (o
+    `?scope=` da requisição NUNCA afeta este bloco), mas "sem escopo"
+    NUNCA significou "todo o histórico do banco": significa "desde o
+    início da BASE CONTÁBIL atual" (`base_started_at`, de
+    `app.sessions.resolve_accounting_base`) -- um reset de
+    `paper_starting_balance_usd` nunca soma o resultado de uma base
+    anterior à nova âncora. `realized_price_pnl`/`fees_paid` somam
+    posições ABERTAS (sempre, sem corte -- por construção nunca existem
+    posições abertas atravessando um reset, já que
+    `_guard_starting_balance_reset` só permite resetar sem posições
+    abertas) e FECHADAS (cortadas por `closed_at >= base_started_at`).
+    Taxas vêm da fonte canônica `repo.execution_fees`, cortadas por
+    `Execution.executed_at >= base_started_at`."""
+    symbols = [symbol] if symbol else _configured_symbols(orch)
+
+    closed_realized = 0.0
+    for s in symbols:
+        for p in repo.closed_positions(session, s, since=base_started_at):
+            closed_realized += p.realized_pnl
+
+    fees_paid = sum(repo.execution_fees(session, s, since=base_started_at) for s in symbols)
+
+    open_positions = repo.open_positions(session, symbol)
+    open_realized = sum(p.realized_pnl for p in open_positions)
+    exposure_usd = sum(p.qty * p.avg_entry_price for p in open_positions)
+
+    marks = []
+    for p in open_positions:
+        price, source, at = _resolve_mark_price(orch, session, p.symbol)
+        marks.append(PositionMarkView(
+            symbol=p.symbol, side=p.side, qty=p.qty, avg_entry_price=p.avg_entry_price,
+            mark_price=price, mark_source=source, mark_at=at,
+        ))
+    unrealized = compute_unrealized_pnl(marks)
+
+    funding_paid, funding_received = _funding_for_symbols(orch, session, symbols, since=base_started_at)
+
+    return {
+        "realized_price_pnl": closed_realized + open_realized,
+        "fees_paid": fees_paid,
+        "funding_paid": funding_paid,
+        "funding_received": funding_received,
+        "unrealized": unrealized,
+        "exposure_usd": exposure_usd,
+        "open_positions_count": len(open_positions),
+    }
+
+
+def _period_state(orch, session, since, symbol: str | None):
+    """Fase 3.1.1: componentes do bloco `period_performance` -- um
+    recorte de DESEMPENHO, nunca de patrimônio. `realized_price_pnl`
+    soma EXCLUSIVAMENTE posições FECHADAS cujo `closed_at` cai no
+    recorte (`realized_pnl_attribution="position_close"` -- não existe
+    ledger de P&L por fill individual, ver `compute_period_performance`)
+    -- NUNCA inclui o P&L parcial já realizado de uma posição AINDA
+    aberta (decisão explícita do PO: isso vazaria histórico de uma
+    posição aberta antes do recorte para dentro de todo `daily`
+    subsequente). Taxas/funding filtrados pelo instante do próprio
+    evento (`Execution.executed_at`/`FundingEvent.occurred_at`)."""
+    symbols = [symbol] if symbol else _configured_symbols(orch)
+
+    closed_realized = 0.0
+    closed_trades_count = 0
+    for s in symbols:
+        for p in repo.closed_positions(session, s, since=since):
+            closed_realized += p.realized_pnl
+            closed_trades_count += 1
+
+    fees_paid = sum(repo.execution_fees(session, s, since=since) for s in symbols)
+    fills_count = sum(repo.execution_fills_count(session, s, since=since) for s in symbols)
+    funding_paid, funding_received = _funding_for_symbols(orch, session, symbols, since=since)
+
+    return {
+        "realized_price_pnl": closed_realized,
+        "fees_paid": fees_paid,
+        "funding_paid": funding_paid,
+        "funding_received": funding_received,
+        "fills_count": fills_count,
+        "closed_trades_count": closed_trades_count,
+    }
+
+
+@router.get("/portfolio-summary")
+def get_portfolio_summary(request: Request, scope: str = "lifetime"):
+    """Fase 3.1.1 (último gate contábil da auditoria do PO): patrimônio
+    (equity) calculado SOB DEMANDA -- nunca persistido nesta fase
+    (account_snapshots permanece reservada para uma fase futura de série
+    histórica, decisão do PO). Contrato completo em docs/PAINEL_FINANCEIRO.md.
+
+    Dois blocos DELIBERADAMENTE separados, nunca confundidos:
+    - `portfolio`: `current_equity = frozen_starting_balance +
+      base_realized_price_pnl + current_unrealized_price_pnl -
+      base_execution_fees + base_funding_net` -- SEMPRE o mesmo valor,
+      IDÊNTICO independente de `?scope=`. "base" aqui é a BASE CONTÁBIL
+      atual (`app.sessions.resolve_accounting_base`) -- desde o último
+      reset de `paper_starting_balance_usd`, NUNCA "todo o histórico do
+      banco" quando já existiu um reset. `starting_balance` vem CONGELADO
+      no snapshot da sessão que estabeleceu a base
+      (`app.sessions.resolve_starting_balance`), nunca lido de `Settings`
+      ao vivo.
+    - `period_performance`: recorte de DESEMPENHO pelo `scope` pedido --
+      nunca chamado de equity, nunca soma `starting_balance`; também
+      nunca alcança dados de antes do início da base contábil atual."""
+    if scope not in _VALID_SCOPES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"scope inválido: {scope!r}. Valores aceitos: {list(_VALID_SCOPES)}.",
+        )
+    orch = request.app.state.orchestrator
+    with session_scope(orch.session_factory) as session:
+        state = repo.get_or_create_system_state(session)
+        active_session = repo.get_active_session(session, state)
+        session_started_at = active_session.started_at if active_session is not None else None
+        base_started_at, base_session = resolve_accounting_base(session, active_session)
+        since = _scope_since(scope, session_started_at, base_started_at)
+        since_iso = since.isoformat() if since is not None else None
+
+        starting_balance, starting_balance_source = resolve_starting_balance(active_session)
+
+        # --- portfolio (equity): SEMPRE lifetime-DA-BASE, nunca afetado
+        # pelo ?scope= da requisição. ------------------------------------
+        consolidated = _portfolio_state(orch, session, symbol=None, base_started_at=base_started_at)
+        equity = compute_equity(
+            starting_balance=starting_balance, starting_balance_source=starting_balance_source,
+            realized_price_pnl=consolidated["realized_price_pnl"],
+            fees_paid=consolidated["fees_paid"],
+            funding_paid=consolidated["funding_paid"], funding_received=consolidated["funding_received"],
+            unrealized=consolidated["unrealized"],
+            open_positions_count=consolidated["open_positions_count"],
+            exposure_usd=consolidated["exposure_usd"],
+        )
+
+        # --- period_performance: recorte pelo scope pedido, sempre
+        # limitado pela base contábil atual (_scope_since já garante). ---
+        period_consolidated = _period_state(orch, session, since, symbol=None)
+        period = compute_period_performance(
+            scope=scope, since_iso=since_iso,
+            realized_price_pnl=period_consolidated["realized_price_pnl"],
+            fees_paid=period_consolidated["fees_paid"],
+            funding_paid=period_consolidated["funding_paid"], funding_received=period_consolidated["funding_received"],
+            fills_count=period_consolidated["fills_count"],
+            closed_trades_count=period_consolidated["closed_trades_count"],
+        )
+
+        per_symbol = {}
+        for symbol in _configured_symbols(orch):
+            comp = _portfolio_state(orch, session, symbol=symbol, base_started_at=base_started_at)
+            has_funding = comp["funding_paid"] is not None
+            per_symbol[symbol] = {
+                "realized_price_pnl": comp["realized_price_pnl"],
+                "unrealized_pnl": comp["unrealized"].total,
+                "unrealized_complete": comp["unrealized"].complete,
+                "fees_paid": comp["fees_paid"],
+                "funding_paid": comp["funding_paid"] if has_funding else UNAVAILABLE,
+                "funding_received": comp["funding_received"] if has_funding else UNAVAILABLE,
+                "funding_net": (
+                    (comp["funding_received"] - comp["funding_paid"]) if has_funding else UNAVAILABLE
+                ),
+                "exposure_usd": comp["exposure_usd"],
+                "open_positions_count": comp["open_positions_count"],
+                "positions": [p.__dict__ for p in comp["unrealized"].per_position],
+            }
+
+        return {
+            "portfolio": {
+                "accounting_base_started_at": base_started_at.isoformat() if base_started_at is not None else None,
+                "starting_balance": equity.starting_balance,
+                "starting_balance_source": equity.starting_balance_source,
+                "realized_price_pnl": equity.realized_price_pnl,
+                "unrealized_pnl": equity.unrealized_pnl,
+                "fees_paid": equity.fees_paid,
+                "funding_paid": equity.funding_paid,
+                "funding_received": equity.funding_received,
+                "funding_net": equity.funding_net,
+                "realized_net_pnl": equity.realized_net_pnl,
+                "equity": equity.equity,
+                "equity_complete": equity.equity_complete,
+                "open_positions_count": equity.open_positions_count,
+                "exposure_usd": equity.exposure_usd,
+            },
+            "period_performance": {
+                "scope": period.scope,
+                "since": period.since,
+                "realized_price_pnl": period.realized_price_pnl,
+                "fees_paid": period.fees_paid,
+                "funding_paid": period.funding_paid,
+                "funding_received": period.funding_received,
+                "funding_net": period.funding_net,
+                "realized_net_pnl": period.realized_net_pnl,
+                "fills_count": period.fills_count,
+                "closed_trades_count": period.closed_trades_count,
+                "realized_pnl_attribution": period.realized_pnl_attribution,
+            },
+            "per_symbol": per_symbol,
+        }
 
 
 @router.get("/positions")
@@ -339,19 +648,12 @@ def get_chart_data(request: Request, symbol: str, limit: int = 500):
 
         # Preço visual: candle em formação (quando o provider expõe um,
         # nunca REPLAY/PAPER_LOCAL) -- fallback honesto para o fechamento
-        # do último candle persistido, nunca fingindo tempo real.
-        visual = getattr(orch, "visual_price_state", {}).get(symbol)
-        if visual is not None:
-            visual_price = visual["price"]
-            visual_price_at = visual["at"].isoformat()
-            visual_price_source = "forming_candle"
-        elif candles:
-            last = candles[-1]
-            visual_price = last.close
-            visual_price_at = last.open_time.isoformat()
-            visual_price_source = "last_closed_candle"
-        else:
-            visual_price, visual_price_at, visual_price_source = None, None, None
+        # do último candle persistido, nunca fingindo tempo real. Mesma
+        # função usada por /api/portfolio-summary (_resolve_mark_price) --
+        # uma única fonte de marcação a mercado.
+        visual_price, visual_price_source, visual_price_at = _resolve_mark_price(
+            orch, session, symbol, timeframe, candles=candles,
+        )
 
         open_pos = repo.open_positions(session, symbol)
         position = None
@@ -428,13 +730,36 @@ def get_chart_data(request: Request, symbol: str, limit: int = 500):
 
 @router.get("/equity-curve")
 def get_equity_curve(request: Request):
+    """Fase 3.1.1 (último gate contábil da auditoria do PO): mesma
+    resolução CANÔNICA do saldo inicial E da base contábil usadas por
+    `GET /api/portfolio-summary` -- `app.sessions.resolve_starting_balance`/
+    `resolve_accounting_base`, lidas do snapshot CONGELADO da sessão que
+    estabeleceu a base ativa, nunca de `Settings.paper_starting_balance_usd`
+    ao vivo. A curva NUNCA desenha uma continuidade falsa através de um
+    reset de saldo: `repo.closed_positions(since=base_started_at)` já
+    exclui estruturalmente qualquer trade fechado ANTES do início da base
+    atual -- o primeiro ponto da curva é sempre o saldo congelado da base,
+    nunca um valor que incorpore resultado de uma base anterior. Terceiro
+    hardcode independente de `1000.0` encontrado e corrigido nesta
+    correção (os outros dois eram o antigo `_metrics_for_trades` e o
+    literal `"1000.00"` do frontend). Curva REALIZADA apenas (nunca
+    inclui P&L não realizado de posições abertas) -- mesma limitação
+    documentada de `current_drawdown_money`/`max_drawdown_money`. Cada
+    degrau usa `Position.fees_paid` (não a fonte canônica `Execution.fee`)
+    -- uma taxa órfã não move esta curva; é uma visualização aproximada,
+    não o patrimônio oficial (esse é sempre `GET /api/portfolio-summary`)."""
     orch = request.app.state.orchestrator
     with session_scope(orch.session_factory) as session:
+        state = repo.get_or_create_system_state(session)
+        active_session = repo.get_active_session(session, state)
+        starting_balance, _source = resolve_starting_balance(active_session)
+        base_started_at, _base_session = resolve_accounting_base(session, active_session)
+
         closed = sorted(
-            [p for p in repo.closed_positions(session) if p.closed_at],
+            [p for p in repo.closed_positions(session, since=base_started_at) if p.closed_at],
             key=lambda p: p.closed_at,
         )
-        running = 1000.0
+        running = starting_balance
         points = [{"t": None, "equity": running}]
         for p in closed:
             running += p.realized_pnl - p.fees_paid

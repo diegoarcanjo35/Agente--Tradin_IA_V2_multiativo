@@ -62,6 +62,22 @@ def test_max_drawdown_money_and_pct():
     assert result.max_drawdown_pct == pytest.approx(80.0 / 1100.0 * 100.0)
 
 
+def test_current_drawdown_reflects_the_last_equity_point_not_the_peak():
+    """Fase 3.1.1: 'drawdown atual' é a distância do pico até o ÚLTIMO
+    ponto da curva (não o máximo histórico já visto). Curva: 1000 -> 1100
+    (pico) -> 1020 (drawdown de 80 aqui) -> 1120 (novo pico, drawdown
+    atual volta a 0)."""
+    trades = [trade(100, 0, 0), trade(-80, 0, 1)]
+    result = compute_metrics(trades, starting_balance=1000.0)
+    assert result.current_drawdown_money == pytest.approx(80.0)
+    assert result.max_drawdown_money == pytest.approx(80.0)
+
+    trades_recovered = [trade(100, 0, 0), trade(-80, 0, 1), trade(100, 0, 2)]
+    result_recovered = compute_metrics(trades_recovered, starting_balance=1000.0)
+    assert result_recovered.current_drawdown_money == pytest.approx(0.0)  # 1120 é um novo pico
+    assert result_recovered.max_drawdown_money == pytest.approx(80.0)  # o máximo histórico persiste
+
+
 def test_return_over_drawdown():
     trades = [trade(100, 0, 0), trade(-80, 0, 1), trade(100, 0, 2)]
     result = compute_metrics(trades, starting_balance=1000.0)

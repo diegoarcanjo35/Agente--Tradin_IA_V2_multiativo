@@ -310,10 +310,21 @@ class Orchestrator:
         against, looked up cheaply by primary key. Returns None if no
         session is active yet (e.g. a test-built Orchestrator that never
         went through app.api.main.build_orchestrator) -- counters simply
-        aren't incremented in that case (see app.sessions.increment)."""
-        if state.active_session_id is None:
-            return None
-        return session.get(OperationalSession, state.active_session_id)
+        aren't incremented in that case (see app.sessions.increment).
+
+        Fase 3.1.1 (correção final da auditoria do PO, item 2): thin
+        wrapper kept only so every internal `self._active_session(...)`
+        call site in this class keeps working unchanged -- the real,
+        PUBLIC, instance-independent implementation is
+        `repo.get_active_session` (it never actually needed `self`;
+        `active_session_id` lives on the single global `SystemState` row,
+        never per-orchestrator). Any NEW caller -- especially one that
+        might hold either an `Orchestrator` or a `MultiSymbolOrchestrator`
+        (which never had this private method, the cause of a real
+        `AttributeError` in `POST /kill-switch/engage` under multiativo)
+        -- must call `repo.get_active_session(session, state)` directly,
+        never this method."""
+        return repo.get_active_session(session, state)
 
     def _common_risk_fields(self, state, data_is_stale: bool, clock_sync) -> dict:
         return dict(
@@ -959,6 +970,20 @@ class MultiSymbolOrchestrator:
         # `MultiSymbolOrchestrator` (e.g. app/api/main.py::_graceful_shutdown)
         # can keep using `orch.session_factory` unchanged.
         return next(iter(self.orchestrators.values())).session_factory
+
+    @property
+    def execution_engine(self):
+        # Fase 3.1.1 (correção final da auditoria do PO, item 2): a SAME
+        # shared ExecutionEngine instance is injected into every per-symbol
+        # Orchestrator (see app/api/main.py::build_orchestrator -- one
+        # `execution_engine` object built once, passed to every symbol's
+        # Orchestrator) -- exposed here with the exact same delegation
+        # pattern as session_factory/funding_provider/price_state above, so
+        # a caller that only holds `orch` (not knowing/caring whether it is
+        # a plain Orchestrator or this scheduler) can always reach it, e.g.
+        # POST /kill-switch/engage cancelling non-terminal orders across
+        # every symbol.
+        return next(iter(self.orchestrators.values())).execution_engine
 
     @property
     def funding_provider(self):

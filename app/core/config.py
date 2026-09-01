@@ -4,6 +4,7 @@ the API surface, per the non-negotiable "no Demo/Real switch" requirement.
 """
 from __future__ import annotations
 
+import math
 import re
 from datetime import datetime, timezone
 from enum import Enum
@@ -244,6 +245,19 @@ class Settings(BaseSettings):
     paper_live_fee_rate: float = Field(default=0.0006)
     paper_live_slippage_bps: float = Field(default=5.0)
 
+    # Fase 3.1.1 (correção do painel financeiro): única fonte configurável
+    # do capital inicial PAPER usado no cálculo de patrimônio (equity) --
+    # substitui os dois hardcodes independentes que existiam antes (um
+    # literal no backend, um literal string no frontend). Nunca um segredo;
+    # entra no snapshot/fingerprint da sessão operacional
+    # (app/sessions.py::_sanitized_config_snapshot) -- alterá-lo gera uma
+    # sessão operacional nova, mas NUNCA reclassifica ou apaga resultados já
+    # registrados (posições/ordens/sinais antigos permanecem intocados; o
+    # valor só afeta o cálculo de equity feito a partir de agora). Não
+    # implementa depósito/saque/ledger de caixa -- é apenas o ponto de
+    # partida do patrimônio. Ver docs/PAINEL_FINANCEIRO.md.
+    paper_starting_balance_usd: float = Field(default=1000.0)
+
     # Correção v1.1 #5: optional, default-OFF external AI Shadow provider.
     # SimulatedProvider remains the production default in every case --
     # this only takes effect when explicitly enabled AND an API key is
@@ -408,6 +422,24 @@ class Settings(BaseSettings):
         # all) rather than refuse to start.
         if v <= 0:
             raise ValueError(f"{info.field_name.upper()} deve ser positivo; recebido {v!r}.")
+        return v
+
+    @field_validator("paper_starting_balance_usd")
+    @classmethod
+    def _validate_paper_starting_balance_usd(cls, v: float) -> float:
+        # Fase 3.1.1: "aceitar apenas valor finito e maior que zero" -- um
+        # NaN/Infinity aqui se propagaria silenciosamente por toda a
+        # fórmula de equity (patrimônio "NaN" ou "Infinity" exibido ao
+        # operador), e zero/negativo não tem semântica válida como capital
+        # inicial de uma carteira PAPER.
+        if not math.isfinite(v):
+            raise ValueError(
+                f"PAPER_STARTING_BALANCE_USD deve ser um valor finito; recebido {v!r}."
+            )
+        if v <= 0:
+            raise ValueError(
+                f"PAPER_STARTING_BALANCE_USD deve ser maior que zero; recebido {v!r}."
+            )
         return v
 
     @field_validator("poll_healthy_ticks_to_recover")

@@ -83,6 +83,20 @@ Estritamente observacional: nenhum controle de execução manual. Ver
 `docs/PAINEL_GRAFICO.md` para arquitetura completa, contrato da API
 (`GET /api/chart-data`) e legenda de cores.
 
+## Painel financeiro (Fase 3.1.1)
+
+O topo do painel mostra o **patrimônio atual** (equity), o resultado
+líquido realizado, o P&L não realizado das posições abertas e o saldo
+inicial configurado (`PAPER_STARTING_BALANCE_USD`, único ponto de
+configuração — nunca mais um valor fixo no código). Um card separado
+("Impacto dos Custos de Negociação") mostra taxas, slippage (já como
+custo financeiro real, nunca a diferença unitária de preço) e funding —
+sempre com o aviso de que esses valores já estão refletidos no resultado
+líquido, nunca descontados uma segunda vez. Ver `docs/PAINEL_FINANCEIRO.md`
+para a fórmula oficial, os escopos disponíveis (`lifetime`/`session`/
+`daily`) e o contrato completo da API (`GET /api/portfolio-summary`,
+`GET /api/costs`).
+
 ## Como gerar credenciais Bybit Demo Trading
 
 Ver `docs/OPERACAO_DEMO.md`.

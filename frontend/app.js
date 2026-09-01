@@ -32,6 +32,9 @@ const ORDER_STATUS_LABELS = {
   FILLED: "PREENCHIDA", CANCEL_PENDING: "CANCELAMENTO PENDENTE", CANCELLED: "CANCELADA",
   REJECTED: "REJEITADA", UNKNOWN: "DESCONHECIDA",
 };
+const SCOPE_LABELS = {
+  lifetime: "histórico completo", session: "sessão atual", daily: "hoje (UTC)",
+};
 
 function translateDirection(direction) {
   return DIRECTION_LABELS[direction] || direction;
@@ -50,6 +53,64 @@ function isUnavailable(v) {
 function pnlClass(v) {
   if (typeof v !== "number") return "";
   return v > 0 ? "positive" : v < 0 ? "negative" : "";
+}
+
+// Fase 3.1.1 (correção final da auditoria do PO): toda métrica financeira
+// exibida no painel passa por um destes três formatadores -- nenhum número
+// cru sem unidade. `N/D` (nunca `null`/`NaN`/`Infinity`/um zero inventado)
+// para qualquer valor não numérico ou não finito, incluindo o sentinela
+// `"indisponível"` que a API já usa.
+function fmtCurrency(v, signed = false) {
+  if (isUnavailable(v) || typeof v !== "number" || !Number.isFinite(v)) return "N/D";
+  const abs = Math.abs(v);
+  const formatted = abs.toLocaleString("pt-BR", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  let prefix = "";
+  if (v > 0) prefix = signed ? "+" : "";
+  else if (v < 0) prefix = "–"; // travessão curto, nunca hífen ASCII
+  return `${prefix}US$ ${formatted}`;
+}
+
+// `v` já deve estar na escala 0-100 (nunca a fração 0-1 crua) -- ver os
+// pontos de chamada (ex.: win_rate * 100).
+function fmtPercent(v, digits = 1, signed = false) {
+  if (isUnavailable(v) || typeof v !== "number" || !Number.isFinite(v)) return "N/D";
+  const formatted = Math.abs(v).toLocaleString("pt-BR", { minimumFractionDigits: digits, maximumFractionDigits: digits });
+  let prefix = "";
+  if (v > 0) prefix = signed ? "+" : "";
+  else if (v < 0) prefix = "–";
+  return `${prefix}${formatted}%`;
+}
+
+function fmtRatio(v, digits = 2) {
+  if (isUnavailable(v) || typeof v !== "number" || !Number.isFinite(v)) return "N/D";
+  return `${v.toLocaleString("pt-BR", { minimumFractionDigits: digits, maximumFractionDigits: digits })}×`;
+}
+
+function fmtInt(v) {
+  if (isUnavailable(v) || typeof v !== "number" || !Number.isFinite(v)) return "N/D";
+  return String(Math.round(v));
+}
+
+// Cria um cartão de estatística (rótulo + valor) dentro de `container`,
+// sempre via textContent/createElement -- nunca innerHTML. `opts.title`
+// vira o tooltip nativo do navegador (acessível, sem componente extra).
+function statCard(container, label, valueText, opts = {}) {
+  const card = document.createElement("div");
+  card.className = "stat-card" + (opts.cardClass ? ` ${opts.cardClass}` : "");
+
+  const labelEl = document.createElement("span");
+  labelEl.className = "stat-label";
+  labelEl.textContent = label;
+  if (opts.title) labelEl.title = opts.title;
+
+  const valueEl = document.createElement("span");
+  valueEl.className = "stat-value" + (opts.valueClass ? ` ${opts.valueClass}` : "");
+  valueEl.textContent = valueText;
+
+  card.appendChild(labelEl);
+  card.appendChild(valueEl);
+  container.appendChild(card);
+  return card;
 }
 
 async function getJSON(url, opts) {
@@ -109,6 +170,18 @@ async function refreshState() {
   $("chip-op-state").textContent = `ESTADO OPERACIONAL: ${OPERATIONAL_STATE_LABELS[s.operational_state] || s.operational_state}`;
   $("env-banner").textContent = s.environment_banner;
   $("last-updated").textContent = new Date().toLocaleString("pt-BR");
+
+  // Item A da nova hierarquia: o motivo principal de bloqueio precisa
+  // aparecer junto do banner de estado, nunca só dentro do diagnóstico
+  // técnico recolhido.
+  const reasonLine = $("block-reason-line");
+  if (s.trading_blocked && s.block_reason) {
+    reasonLine.textContent = `Motivo do bloqueio: ${s.block_reason}`;
+    reasonLine.hidden = false;
+  } else {
+    reasonLine.hidden = true;
+    reasonLine.textContent = "";
+  }
 
   // Causas de bloqueio independentes -- nunca colapsadas num único booleano
   // (item 7.5/7.9), e estados críticos nunca dependem só de cor: cada linha
@@ -175,53 +248,147 @@ async function refreshOrders() {
   );
 }
 
+// Fase 3.1.1 (correção final da auditoria do PO), seção F: "Impacto dos
+// Custos de Negociação". Nunca soma o slippage de novo ao patrimônio/
+// resultado líquido -- ele já está embutido no preço executado (aviso
+// fixo no HTML, ver index.html). Campos antigos `slippage_avg_usd`/
+// `slippage_total_usd` (diferença unitária de preço, nunca dinheiro) não
+// existem mais na API -- ver app/metrics/engine.py.
+// `N/D` nunca herda cor de positivo/negativo/custo -- só um valor
+// numérico conhecido justifica a classe visual.
+function classIfKnown(v, cls) {
+  return isUnavailable(v) || typeof v !== "number" || !Number.isFinite(v) ? "" : cls;
+}
+
 async function refreshCosts() {
-  const c = await getJSON("/api/costs");
+  const [c, summary] = await Promise.all([
+    getJSON("/api/costs"), getJSON("/api/portfolio-summary"),
+  ]);
+  const portfolio = summary.portfolio;
   const box = $("costs-box");
   clearChildren(box);
-  kvRow(box, "Taxas acumuladas", fmtNumber(c.fees_total));
-  kvRow(box, "Slippage médio (USD)", fmtNumber(c.slippage_avg_usd));
-  kvRow(box, "Slippage total (USD)", fmtNumber(c.slippage_total_usd));
-  kvRow(box, "Ordens com preço de referência conhecido", c.priced_orders_count);
+
+  const hasFunding = !isUnavailable(portfolio.funding_paid) && !isUnavailable(portfolio.funding_received);
+  const adverseGross = (typeof c.adverse_slippage_cost_usd === "number" ? c.adverse_slippage_cost_usd : 0)
+    + c.fees_total + (hasFunding ? portfolio.funding_paid : 0);
+  const credits = (typeof c.price_improvement_value_usd === "number" ? c.price_improvement_value_usd : 0)
+    + (hasFunding ? portfolio.funding_received : 0);
+
+  statCard(box, "Taxas pagas", fmtCurrency(c.fees_total), {
+    valueClass: classIfKnown(c.fees_total, "cost"), title: "Soma de todas as taxas de execução pagas (entrada e saída).",
+  });
+  statCard(box, "Slippage adverso", fmtCurrency(c.adverse_slippage_cost_usd), {
+    valueClass: classIfKnown(c.adverse_slippage_cost_usd, "cost"),
+    title: "Custo financeiro real (diferença de preço × quantidade executada) das execuções piores que a referência.",
+  });
+  statCard(box, "Melhoria de preço", fmtCurrency(c.price_improvement_value_usd), {
+    valueClass: classIfKnown(c.price_improvement_value_usd, "positive"),
+    title: "Valor financeiro ganho em execuções melhores que a referência -- nunca cancela o slippage adverso silenciosamente.",
+  });
+  statCard(box, "Impacto líquido de execução", fmtCurrency(c.net_slippage_impact_usd, true), {
+    valueClass: pnlClass(typeof c.net_slippage_impact_usd === "number" ? -c.net_slippage_impact_usd : 0),
+    title: "Slippage adverso menos melhoria de preço -- diagnóstico de atribuição, já refletido no resultado líquido.",
+  });
+  statCard(box, "Funding pago", fmtCurrency(portfolio.funding_paid), { valueClass: classIfKnown(portfolio.funding_paid, "cost") });
+  statCard(box, "Funding recebido", fmtCurrency(portfolio.funding_received), { valueClass: classIfKnown(portfolio.funding_received, "positive") });
+  statCard(box, "Funding líquido", fmtCurrency(portfolio.funding_net, true), {
+    valueClass: pnlClass(typeof portfolio.funding_net === "number" ? portfolio.funding_net : 0),
+  });
+  statCard(box, "Slippage % ponderado", fmtPercent(c.weighted_slippage_pct, 3, true), {
+    title: "Impacto financeiro líquido do slippage dividido pelo notional de referência -- ponderado por tamanho, nunca a média simples dos percentuais.",
+  });
+  statCard(box, "Ordens analisadas", `${fmtInt(c.priced_orders_count)} (${fmtInt(c.unpriced_orders_count)} sem referência)`);
+  statCard(box, "Impacto adverso bruto", fmtCurrency(adverseGross), {
+    valueClass: classIfKnown(adverseGross, "cost"), title: "Taxas + slippage adverso + funding pago -- diagnóstico, nunca uma segunda dedução do patrimônio.",
+  });
+  statCard(box, "Benefícios / créditos", fmtCurrency(credits), { valueClass: "positive" });
+
+  const bySymbolTbody = document.querySelector("#costs-by-symbol-table tbody");
+  const symbols = Object.keys(summary.per_symbol || {});
+  const rows = await Promise.all(symbols.map(async (symbol) => {
+    const sc = await getJSON(`/api/costs?symbol=${encodeURIComponent(symbol)}`);
+    return [
+      symbol, `${fmtInt(sc.priced_orders_count)} (${fmtInt(sc.unpriced_orders_count)} s/ ref.)`,
+      fmtCurrency(sc.fees_total), fmtCurrency(sc.adverse_slippage_cost_usd),
+      fmtCurrency(sc.price_improvement_value_usd),
+    ];
+  }));
+  setRows(bySymbolTbody, rows);
 }
 
+// Fase 3.1.1, seção E: "Desempenho" -- taxa de acerto/payoff/profit
+// factor/drawdown, sempre com unidade explícita.
 async function refreshMetrics() {
   const m = await getJSON("/api/metrics");
+  const grid = $("performance-grid");
+  clearChildren(grid);
 
-  const metricsBox = $("metrics-box");
-  clearChildren(metricsBox);
-  kvRow(metricsBox, "Operações encerradas", m.closed_trades_count);
-  kvRow(metricsBox, "Taxa de acerto", fmtNumber(m.win_rate, 3));
-  kvRow(metricsBox, "Payoff", fmtNumber(m.payoff));
-  kvRow(metricsBox, "Expectativa", fmtNumber(m.expectancy));
-
-  const pnlBox = $("pnl-box");
-  clearChildren(pnlBox);
-  kvRow(pnlBox, "Lucro bruto", fmtNumber(m.gross_profit), pnlClass(m.gross_profit));
-  kvRow(pnlBox, "Prejuízo bruto", fmtNumber(m.gross_loss), pnlClass(m.gross_loss));
-  kvRow(pnlBox, "Lucro líquido", fmtNumber(m.net_profit), pnlClass(m.net_profit));
-  kvRow(pnlBox, "Comissões", fmtNumber(m.commissions));
-  kvRow(pnlBox, "Taxa de financiamento (Funding)", fmtNumber(m.funding));
-
-  const riskBox = $("risk-metrics-box");
-  clearChildren(riskBox);
-  kvRow(riskBox, "Fator de lucro (Profit Factor)", fmtNumber(m.profit_factor));
-  kvRow(riskBox, "Rebaixamento máx. ($) (Drawdown)", fmtNumber(m.max_drawdown_money));
-  kvRow(riskBox, "Rebaixamento máx. (%) (Drawdown)", fmtNumber(m.max_drawdown_pct));
-  kvRow(riskBox, "Retorno/Rebaixamento", fmtNumber(m.return_over_drawdown));
-  kvRow(riskBox, "Exposição (USD)", fmtNumber(m.exposure_usd));
+  statCard(grid, "Operações encerradas", fmtInt(m.closed_trades_count));
+  statCard(grid, "Taxa de acerto", fmtPercent(typeof m.win_rate === "number" ? m.win_rate * 100 : m.win_rate));
+  statCard(grid, "Profit Factor", fmtRatio(m.profit_factor), {
+    title: "Lucro bruto dividido pelo prejuízo bruto absoluto -- acima de 1× é lucrativo no período.",
+  });
+  statCard(grid, "Payoff", fmtRatio(m.payoff), {
+    title: "Ganho médio por operação vencedora dividido pela perda média por operação perdedora.",
+  });
+  statCard(grid, "Expectância por operação", fmtCurrency(m.expectancy, true), {
+    valueClass: pnlClass(typeof m.expectancy === "number" ? m.expectancy : 0),
+    title: "Resultado médio esperado por operação, combinando taxa de acerto e tamanho médio de ganhos/perdas.",
+  });
+  statCard(grid, "Drawdown atual", fmtCurrency(m.current_drawdown_money), {
+    valueClass: (typeof m.current_drawdown_money === "number" && m.current_drawdown_money > 0) ? "negative" : "",
+    title: "Distância do último ponto da curva realizada até o pico anterior -- 0 quando no próprio pico.",
+  });
+  statCard(grid, "Drawdown máximo", fmtCurrency(m.max_drawdown_money), {
+    valueClass: (typeof m.max_drawdown_money === "number" && m.max_drawdown_money > 0) ? "negative" : "",
+  });
+  statCard(grid, "Drawdown máximo (%)", fmtPercent(m.max_drawdown_pct));
+  statCard(grid, "Retorno / Drawdown", fmtRatio(m.return_over_drawdown));
 }
 
-async function refreshAccount() {
+// Fase 3.1.1, seção B: "Resumo financeiro principal" -- patrimônio
+// calculado SOB DEMANDA a cada atualização (nunca persistido nesta fase,
+// ver app/api/routes_dashboard.py::get_portfolio_summary). Decisão
+// definitiva do PO: equity NÃO TEM escopo -- `portfolio` é sempre
+// lifetime, idêntico não importa o que `period_performance` mostre; o
+// badge exibe "histórico completo" porque é isso que `portfolio` sempre
+// representa aqui, nunca um seletor que trocaria o patrimônio exibido.
+async function refreshPortfolioSummary() {
+  const body = await getJSON("/api/portfolio-summary?scope=lifetime");
+  const p = body.portfolio;
+
+  $("equity-scope-badge").textContent = `escopo: ${SCOPE_LABELS.lifetime}`;
+  $("equity-incomplete-notice").hidden = p.equity_complete !== false;
+
+  const grid = $("hero-grid");
+  clearChildren(grid);
+
+  const equityDelta = (typeof p.equity === "number" && typeof p.starting_balance === "number")
+    ? p.equity - p.starting_balance : null;
+  statCard(grid, "Patrimônio atual", fmtCurrency(p.equity), {
+    cardClass: "stat-card-hero",
+    valueClass: "stat-value-hero " + pnlClass(equityDelta || 0),
+    title: "Patrimônio = saldo inicial + P&L realizado - taxas + funding líquido + P&L não realizado.",
+  });
+  statCard(grid, "Resultado líquido realizado", fmtCurrency(p.realized_net_pnl, true), {
+    valueClass: pnlClass(typeof p.realized_net_pnl === "number" ? p.realized_net_pnl : 0),
+    title: "P&L de preço já fechado, descontadas as taxas pagas até agora e somado o funding líquido.",
+  });
+  statCard(grid, "P&L não realizado", fmtCurrency(p.unrealized_pnl, true), {
+    valueClass: pnlClass(typeof p.unrealized_pnl === "number" ? p.unrealized_pnl : 0),
+    title: "Valor a mercado das posições abertas agora -- preço visual quando disponível, senão o último fechamento.",
+  });
+  statCard(grid, "Saldo inicial", fmtCurrency(p.starting_balance), {
+    title: "Capital inicial configurado para esta carteira PAPER -- nunca um depósito repetido por sessão.",
+  });
+  statCard(grid, "Posições abertas", fmtInt(p.open_positions_count));
+  statCard(grid, "Exposição total", fmtCurrency(p.exposure_usd), {
+    title: "Soma do valor nocional (quantidade × preço de entrada) das posições abertas -- não é lucro nem prejuízo.",
+  });
+}
+
+async function refreshPositionsTable() {
   const positions = await getJSON("/api/positions");
-  const totalExposure = positions.reduce((acc, p) => acc + p.qty * p.avg_entry_price, 0);
-
-  const accountBox = $("account-box");
-  clearChildren(accountBox);
-  kvRow(accountBox, "Saldo inicial (demo)", "1000.00");
-  kvRow(accountBox, "Posições abertas", positions.length);
-  kvRow(accountBox, "Exposição aberta", totalExposure.toFixed(2));
-
   setRows(
     document.querySelector("#positions-table tbody"),
     positions.map((p) => [
@@ -249,63 +416,64 @@ async function refreshSignals() {
   );
 }
 
-// Fase 3 multiativo: um card por símbolo configurado -- preço/último candle
-// (via posição ou métricas mais recentes disponíveis), defasagem/saúde,
-// sinal, posição, exposição e PnL. Constrói tudo via createElement/
-// textContent (nunca innerHTML), mesmo padrão de kvRow/buildRow acima.
+// Fase 3.1.1, seção D: tabela dinâmica (nunca fixa em BTC/ETH/SOL) gerada
+// a partir de `/api/symbols` -- uma linha por símbolo REALMENTE
+// configurado. Cada linha usa exclusivamente os componentes monetários
+// daquele símbolo (nunca soma/mistura preço unitário ou percentuais de
+// outro ativo -- item 8 da decisão do PO).
 const SYMBOL_HEALTH_LABELS = {
   INICIANDO: "INICIANDO", SAUDAVEL: "SAUDÁVEL",
   DEGRADADO: "DEGRADADO", PARADO: "PARADO", ENCERRANDO: "ENCERRANDO",
 };
 
 async function refreshSymbolsSummary() {
-  const [symbolsResp, state, positions, metrics] = await Promise.all([
-    getJSON("/api/symbols"), getJSON("/api/state"), getJSON("/api/positions"), getJSON("/api/metrics"),
+  const [symbolsResp, state, positions, summary] = await Promise.all([
+    getJSON("/api/symbols"), getJSON("/api/state"), getJSON("/api/positions"),
+    getJSON("/api/portfolio-summary?scope=lifetime"),
   ]);
   const symbols = symbolsResp.symbols || [];
   const health = (state.symbols_health && state.symbols_health.per_symbol) || {};
-  const perSymbolMetrics = metrics.per_symbol || {};
+  const perSymbolPortfolio = summary.per_symbol || {};
   const positionsBySymbol = {};
   positions.forEach((p) => { positionsBySymbol[p.symbol] = p; });
 
-  const box = $("symbols-summary-box");
-  clearChildren(box);
+  const lastSignals = await Promise.all(symbols.map(async (symbol) => {
+    const rows = await getJSON(`/api/signals?limit=1&symbol=${encodeURIComponent(symbol)}`);
+    return rows[0] || null;
+  }));
 
-  symbols.forEach((symbol) => {
-    const wrapper = document.createElement("div");
-    wrapper.className = "symbol-summary-card";
-
-    const title = document.createElement("h3");
-    title.textContent = symbol;
-    wrapper.appendChild(title);
-
+  const tbody = document.querySelector("#symbols-summary-table tbody");
+  const rows = symbols.map((symbol, i) => {
     const h = health[symbol] || {};
     const healthLabel = SYMBOL_HEALTH_LABELS[h.status] || h.status || "indisponível";
     const healthy = h.status === "SAUDAVEL";
-    kvRow(wrapper, "Saúde", healthLabel, healthy ? "" : "negative");
-    kvRow(wrapper, "Falhas consecutivas", h.consecutive_failures != null ? h.consecutive_failures : 0);
-    kvRow(wrapper, "Lacuna de dados", h.has_gap ? "SIM" : "não", h.has_gap ? "negative" : "");
 
     const p = positionsBySymbol[symbol];
-    if (p) {
-      kvRow(wrapper, "Posição", `${translateDirection(p.side)} ${p.qty.toFixed(6)} @ ${p.avg_entry_price.toFixed(2)}`);
-      kvRow(wrapper, "Exposição (USD)", (p.qty * p.avg_entry_price).toFixed(2));
-    } else {
-      kvRow(wrapper, "Posição", "nenhuma posição aberta");
-    }
+    const comp = perSymbolPortfolio[symbol] || {};
+    const openPosition = (comp.positions || [])[0];
+    // Preço: só disponível quando há posição aberta marcada a mercado
+    // agora -- nunca o preço de outro símbolo, nunca inventado.
+    const price = openPosition && typeof openPosition.mark_price === "number"
+      ? openPosition.mark_price.toFixed(2) : "N/D";
+    const positionText = p
+      ? `${translateDirection(p.side)} ${p.qty.toFixed(6)} @ ${p.avg_entry_price.toFixed(2)}`
+      : "sem posição";
 
-    const m = perSymbolMetrics[symbol];
-    if (m) {
-      kvRow(wrapper, "PnL líquido", fmtNumber(m.net_profit), pnlClass(m.net_profit));
-      kvRow(wrapper, "Operações encerradas", m.closed_trades_count);
-    }
+    const lastSignal = lastSignals[i];
+    const lastSignalText = lastSignal ? translateDirection(lastSignal.direction) : "N/D";
 
-    box.appendChild(wrapper);
+    return [
+      symbol,
+      { text: healthLabel, className: healthy ? "" : "negative" },
+      price,
+      positionText,
+      fmtCurrency(comp.exposure_usd),
+      { text: fmtCurrency(comp.realized_price_pnl, true), className: pnlClass(typeof comp.realized_price_pnl === "number" ? comp.realized_price_pnl : 0) },
+      { text: fmtCurrency(comp.unrealized_pnl, true), className: pnlClass(typeof comp.unrealized_pnl === "number" ? comp.unrealized_pnl : 0) },
+      lastSignalText,
+    ];
   });
-
-  if (symbols.length === 0) {
-    kvRow(box, "Símbolos", "nenhum símbolo configurado");
-  }
+  setRows(tbody, rows);
 }
 
 // Fase 3.1 (painel gráfico): TradingView Lightweight Charts, vendorizado
@@ -630,8 +798,8 @@ async function refreshEquityCurve() {
 
 async function refreshAll() {
   await Promise.all([
-    refreshState(), refreshMetrics(), refreshAccount(), refreshSignals(),
-    refreshRisk(), refreshAI(), refreshFailures(), refreshEquityCurve(),
+    refreshState(), refreshMetrics(), refreshPortfolioSummary(), refreshPositionsTable(),
+    refreshSignals(), refreshRisk(), refreshAI(), refreshFailures(), refreshEquityCurve(),
     refreshSession(), refreshOrders(), refreshCosts(), refreshSymbolsSummary(),
     refreshChart(),
   ]);

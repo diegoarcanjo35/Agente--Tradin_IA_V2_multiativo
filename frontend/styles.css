@@ -59,6 +59,18 @@ body {
   font-size: 12px;
 }
 
+/* Fase 3.1.1: estado operacional em destaque (item A da hierarquia) e
+   badge de escopo do patrimônio -- nunca só cor, sempre texto explícito. */
+.chip-primary { border-color: var(--accent); font-weight: 700; }
+.chip-scope { font-weight: 600; color: var(--muted); }
+
+.block-reason-line {
+  flex-basis: 100%;
+  font-size: 13px;
+  color: var(--red);
+  padding-top: 4px;
+}
+
 .btn-danger, .btn-secondary {
   border: none;
   border-radius: 6px;
@@ -95,26 +107,79 @@ main { padding: 20px; max-width: 1200px; margin: 0 auto; }
 }
 
 .card h2 { font-size: 13px; text-transform: uppercase; color: var(--muted); margin: 0 0 10px; }
+.card-subtitle { font-size: 12px; color: var(--muted); margin: -6px 0 10px; }
 
-/* Fase 3 multiativo: um card por símbolo dentro do card "Resumo por Símbolo". */
-#symbols-summary-box {
+/* Fase 3.1.1: card "achatado" usado dentro do painel de diagnóstico
+   técnico recolhível -- mesma aparência visual, sem sombra/borda dupla. */
+.card-flat { background: transparent; border: 1px solid var(--border); }
+
+/* Item G: diagnóstico técnico recolhido por padrão (sessão, heartbeat,
+   reconciliação, erros) -- nunca disputa o topo com patrimônio/posições. */
+details.diagnostics summary {
+  cursor: pointer;
+  font-size: 13px;
+  text-transform: uppercase;
+  color: var(--muted);
+  font-weight: 600;
+  padding: 4px 0;
+}
+details.diagnostics[open] summary { margin-bottom: 12px; }
+details.diagnostics .grid-2 { margin-top: 12px; }
+details.diagnostics .card-flat { margin-top: 12px; }
+
+/* Item B: resumo financeiro principal -- números grandes, unidade
+   sempre explícita, nunca uma métrica sem rótulo. */
+.hero-card { border-color: var(--accent); }
+.hero-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; gap: 10px; flex-wrap: wrap; }
+.hero-header h2 { margin: 0; }
+
+.hero-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
   gap: 14px;
 }
+.hero-grid-compact { grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 10px; }
 
-.symbol-summary-card {
+.stat-card {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
   background: var(--bg);
   border: 1px solid var(--border);
   border-radius: 8px;
   padding: 10px 12px;
+  min-width: 0;
 }
+.stat-card-hero { grid-column: span 2; }
+@media (max-width: 520px) { .stat-card-hero { grid-column: span 1; } }
 
-.symbol-summary-card h3 {
-  font-size: 14px;
-  margin: 0 0 8px;
-  color: var(--accent);
+.stat-label { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.3px; }
+.stat-value { font-size: 18px; font-weight: 700; overflow-wrap: anywhere; }
+.stat-value-hero { font-size: 28px; }
+
+/* Item 10 da decisão do PO: cor nunca é o único sinal -- sinal (+/–) e
+   texto (N/D) já vêm embutidos no valor formatado por fmtCurrency/
+   fmtPercent/fmtRatio; estas classes só reforçam visualmente. */
+.stat-value.positive, .stat-value-hero.positive { color: var(--green); }
+.stat-value.negative, .stat-value-hero.negative { color: var(--red); }
+.stat-value.cost { color: var(--amber); }
+
+.notice-amber {
+  background: rgba(251, 191, 36, 0.12);
+  border: 1px solid var(--amber);
+  color: var(--amber);
+  border-radius: 8px;
+  padding: 8px 12px;
+  font-size: 12px;
+  margin-bottom: 12px;
 }
+.notice-muted { font-size: 12px; color: var(--muted); margin: -4px 0 12px; }
+
+/* Fase 3.1.1: tabela responsiva -- rola horizontalmente DENTRO do
+   próprio card em telas estreitas, nunca vazando para a página inteira
+   (item 5, "sem overflow horizontal na página"). */
+.table-scroll { overflow-x: auto; }
+.table-scroll table { min-width: 560px; }
 
 table { width: 100%; border-collapse: collapse; font-size: 13px; }
 th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--border); white-space: nowrap; }
@@ -201,3 +266,29 @@ footer { padding: 20px; color: var(--muted); font-size: 12px; }
 
 .chart-attribution { font-size: 11px; color: var(--muted); margin-top: 10px; }
 .chart-attribution a { color: var(--accent); }
+
+/* Fase 3.1.1 (validação mobile, item 5 da decisão do PO): a página inteira
+   nunca deve rolar horizontalmente -- qualquer conteúdo largo (tabelas)
+   rola DENTRO do próprio .table-scroll, nunca vazando para o body. */
+html, body { max-width: 100%; overflow-x: hidden; }
+
+@media (max-width: 640px) {
+  main { padding: 12px; }
+  .topbar { padding: 12px; gap: 8px; }
+  .topbar h1 { font-size: 16px; min-width: 0; }
+  .card { padding: 12px; }
+
+  .hero-grid { grid-template-columns: 1fr 1fr; }
+  .stat-card-hero { grid-column: 1 / -1; }
+  .stat-value-hero { font-size: 24px; }
+  .hero-grid-compact { grid-template-columns: 1fr 1fr; }
+
+  .grid, .grid-2 { grid-template-columns: 1fr; }
+
+  .chart-header { gap: 8px; }
+  .chart-window-buttons { margin-left: 0; flex-wrap: wrap; }
+  #chart-container { height: 320px; }
+
+  table { font-size: 12px; }
+  th, td { padding: 5px 6px; }
+}

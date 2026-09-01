@@ -8,14 +8,108 @@ import hashlib
 import json
 import uuid
 from dataclasses import asdict
+from datetime import datetime
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.core.clock import utcnow
-from app.persistence.models import OperationalSession
+from app.core.errors import StartingBalanceResetBlockedError
+from app.persistence.models import OperationalSession, Position
 from app.risk.config import RiskLimits
 from app.strategy.engine import StrategyConfig
+
+# Fase 3.1.1 (correção final da auditoria do PO, item 4): valor usado para
+# QUALQUER sessão legada cujo `config_snapshot_json` não tenha a chave
+# `paper_starting_balance_usd` (criada antes deste campo existir) --
+# nunca lido do `Settings` atual do processo, nunca reescrito na linha
+# legada. É o mesmo valor que já era o default histórico do campo.
+LEGACY_STARTING_BALANCE_FALLBACK_USD = 1000.0
+
+
+def resolve_starting_balance(op_session: OperationalSession | None) -> tuple[float, str]:
+    """Fase 3.1.1 (correção final da auditoria do PO, item 4): fonte
+    CANÔNICA e ÚNICA do saldo inicial "congelado" -- lê exclusivamente do
+    `config_snapshot_json` já persistido na sessão operacional ativa,
+    NUNCA do `Settings.paper_starting_balance_usd` atual do processo (que
+    pode já ter mudado desde que a sessão foi criada). Usada por
+    `GET /api/portfolio-summary` e `GET /api/equity-curve` -- a MESMA
+    resolução em ambos, nunca duas implementações divergentes.
+
+    Retorna `(valor, fonte)`:
+    - `"session_snapshot"`: valor real, congelado no momento em que esta
+      sessão foi criada (`start_or_resume_session`) -- o caso normal para
+      qualquer sessão criada a partir desta correção em diante.
+    - `"legacy_fallback_no_session"` / `"legacy_fallback_missing_field"` /
+      `"legacy_fallback_invalid_snapshot"`: nenhuma sessão ativa, ou uma
+      sessão ativa cujo snapshot é anterior a este campo existir (ou está
+      corrompido) -- usa `LEGACY_STARTING_BALANCE_FALLBACK_USD`, nunca o
+      `Settings` atual (que reinterpretaria uma sessão histórica sob uma
+      configuração que ela nunca usou de fato)."""
+    if op_session is None:
+        return LEGACY_STARTING_BALANCE_FALLBACK_USD, "legacy_fallback_no_session"
+    try:
+        snapshot = json.loads(op_session.config_snapshot_json)
+    except (TypeError, ValueError):
+        return LEGACY_STARTING_BALANCE_FALLBACK_USD, "legacy_fallback_invalid_snapshot"
+    if not isinstance(snapshot, dict) or "paper_starting_balance_usd" not in snapshot:
+        return LEGACY_STARTING_BALANCE_FALLBACK_USD, "legacy_fallback_missing_field"
+    return float(snapshot["paper_starting_balance_usd"]), "session_snapshot"
+
+
+def resolve_accounting_base(
+    session: Session, active_session: OperationalSession | None,
+) -> tuple[datetime | None, OperationalSession | None]:
+    """Fase 3.1.1 (último gate contábil da auditoria do PO): a "base
+    contábil" -- não a sessão operacional -- é a âncora de capital
+    atualmente em vigor. Distinção central:
+
+    - Uma SESSÃO OPERACIONAL nova nasce a cada mudança de fingerprint de
+      configuração (estratégia, limites de risco, símbolos, ...) --
+      `start_or_resume_session`. Isso NUNCA reseta patrimônio.
+    - Uma BASE CONTÁBIL nova só nasce quando `paper_starting_balance_usd`
+      especificamente muda (a única mudança que `_guard_starting_balance_reset`
+      trata como reset de capital, e só permitida sem posições abertas).
+      Uma base pode abranger VÁRIAS sessões operacionais consecutivas
+      (ex.: trocar a estratégia no meio do caminho não abre uma base
+      nova).
+
+    Sem nenhuma coluna nova/migration: computado por consulta, caminhando
+    para TRÁS pela cadeia de sessões consecutivas (mesmo `mode`+`symbols`,
+    ordenadas por `started_at`) a partir da sessão ativa, comparando o
+    saldo inicial CONGELADO (`resolve_starting_balance`) de cada uma --
+    para no primeiro valor diferente (a fronteira do reset real); a base
+    começa na sessão logo após essa fronteira, ou na primeiríssima sessão
+    do portfólio se nunca houve reset.
+
+    Retorna `(base_started_at, base_session)` -- `(None, None)` se não há
+    sessão ativa."""
+    if active_session is None:
+        return None, None
+    target_balance, _source = resolve_starting_balance(active_session)
+
+    base = active_session
+    current = active_session
+    while True:
+        prev = session.execute(
+            select(OperationalSession)
+            .where(
+                OperationalSession.mode == current.mode,
+                OperationalSession.symbols == current.symbols,
+                OperationalSession.started_at < current.started_at,
+            )
+            .order_by(OperationalSession.started_at.desc())
+            .limit(1)
+        ).scalar_one_or_none()
+        if prev is None:
+            break
+        prev_balance, _ = resolve_starting_balance(prev)
+        if prev_balance != target_balance:
+            break
+        base = prev
+        current = prev
+    return base.started_at, base
+
 
 # The single supported candle timeframe -- not a configurable Settings
 # field (there is only ever one), so this is a plain module constant rather
@@ -68,6 +162,15 @@ def _sanitized_config_snapshot(settings) -> dict:
         "partial_fill_timeout_seconds": settings.partial_fill_timeout_seconds,
         "paper_live_fee_rate": settings.paper_live_fee_rate,
         "paper_live_slippage_bps": settings.paper_live_slippage_bps,
+        # Fase 3.1.1: o capital inicial usado no cálculo de equity --
+        # entra no snapshot (congelado por sessão, auditável) e no
+        # fingerprint (alterá-lo é uma mudança de configuração como
+        # qualquer outra, gera sessão nova via `start_or_resume_session`
+        # abaixo). Sessões legadas (criadas antes deste campo existir) não
+        # têm esta chave no `config_snapshot_json` já persistido -- ver
+        # app/api/routes_dashboard.py::_session_starting_balance para o
+        # fallback explícito de US$ 1.000,00 nesse caso.
+        "paper_starting_balance_usd": settings.paper_starting_balance_usd,
     }
     if settings.mode.value != "REPLAY":
         # The base URL is not a secret (it's the allowlisted demo host,
@@ -117,6 +220,41 @@ def _config_fingerprint(
     return hashlib.sha256(
         json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
+
+
+def _guard_starting_balance_reset(session: Session, existing: OperationalSession, settings) -> None:
+    """Fase 3.1.1 (correção final da auditoria do PO, item 5): não há
+    ledger de capital (depósito/retirada) neste sistema -- mudar
+    `paper_starting_balance_usd` só é uma operação segura de "redefinir a
+    carteira simulada para uma nova âncora" quando não há nenhuma posição
+    aberta que seria silenciosamente reinterpretada sob o novo capital
+    (ex.: uma posição de US$500 aberta sob uma âncora de US$1.000 não deve
+    de repente parecer "menor" relativa a uma nova âncora de US$5.000 sem
+    nenhuma explicação). Verifica APENAS quando o saldo inicial
+    especificamente mudou (outra mudança de config, ex. limites de risco,
+    nunca aciona esta guarda) -- comparação feita contra o valor
+    CONGELADO na sessão anterior (`resolve_starting_balance`), nunca
+    contra um valor recalculado. Levanta `StartingBalanceResetBlockedError`
+    (interrompe a inicialização do processo, mesma política de
+    `UnsafeBindHostError`/`MigrationError` para condições de início
+    inseguras) -- nunca inicia silenciosamente numa base financeira
+    ambígua."""
+    old_balance, _source = resolve_starting_balance(existing)
+    new_balance = settings.paper_starting_balance_usd
+    if old_balance == new_balance:
+        return
+    open_positions = session.execute(
+        select(Position).where(Position.status == "OPEN")
+    ).scalars().all()
+    if open_positions:
+        symbols_desc = ", ".join(sorted({p.symbol for p in open_positions}))
+        raise StartingBalanceResetBlockedError(
+            f"PAPER_STARTING_BALANCE_USD mudou de {old_balance} para {new_balance}, mas existem "
+            f"posições ABERTAS ({symbols_desc}) que seriam reinterpretadas silenciosamente sob a "
+            "nova âncora de capital. Este sistema não possui ledger de depósito/retirada -- feche "
+            "todas as posições abertas antes de alterar o saldo inicial, ou reverta "
+            "PAPER_STARTING_BALANCE_USD para o valor anterior. Nenhuma alteração foi feita."
+        )
 
 
 def start_or_resume_session(
@@ -169,6 +307,7 @@ def start_or_resume_session(
     if existing is not None:
         if existing.config_fingerprint == fingerprint:
             return existing
+        _guard_starting_balance_reset(session, existing, settings)
         end_session(
             session, existing,
             "Configuração operacional alterada; sessão substituída.",
