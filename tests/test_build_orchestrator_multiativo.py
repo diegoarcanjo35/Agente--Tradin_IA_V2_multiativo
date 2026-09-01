@@ -12,7 +12,13 @@ from app.persistence.db import session_scope
 
 
 def test_build_orchestrator_returns_plain_orchestrator_for_mono_symbol(tmp_path):
-    settings = Settings(mode=RunMode.REPLAY, symbol="BTCUSDT", database_url=f"sqlite:///{tmp_path / 'mono.db'}")
+    settings = Settings(
+        mode=RunMode.REPLAY, symbol="BTCUSDT", database_url=f"sqlite:///{tmp_path / 'mono.db'}",
+        # Fase 3.2: um tick = uma decisão (compatibilidade explícita de 1
+        # minuto); com o default de 5 minutos o primeiro tick devolveria
+        # "aggregating", que é correto mas não é o que este teste verifica.
+        strategy_timeframe_minutes=1,
+    )
     orch = build_orchestrator(settings)
     assert type(orch) is Orchestrator
     assert orch.settings.symbol == "BTCUSDT"

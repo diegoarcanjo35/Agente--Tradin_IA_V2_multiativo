@@ -133,7 +133,14 @@ def test_divergent_series_can_produce_different_signal_directions_per_symbol():
     init_db(engine)
     session_factory = make_session_factory(engine)
 
-    settings = Settings(mode=RunMode.REPLAY, symbols=["BTCUSDT", "ETHUSDT"])
+    settings = Settings(
+        mode=RunMode.REPLAY, symbols=["BTCUSDT", "ETHUSDT"],
+        # Fase 3.2: este teste exercita o pipeline OPERACIONAL "um candle
+        # -> uma decisão". O default do timeframe estratégico passou a ser
+        # 5 minutos; 1 minuto é a compatibilidade explícita mantida pelo PO
+        # e preserva exatamente a intenção original do teste.
+        strategy_timeframe_minutes=1,
+    )
     price_state: dict[str, float] = {}
     risk_engine = RiskEngine(RiskLimits(max_position_usd=50.0, max_total_exposure_usd=500.0, require_stop_loss=False))
     execution_engine = PaperLocalExecutionEngine(price_provider=lambda s: price_state.get(s, 0.0), slippage_bps=0.0)

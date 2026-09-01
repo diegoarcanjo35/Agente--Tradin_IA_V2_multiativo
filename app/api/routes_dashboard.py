@@ -17,7 +17,10 @@ from app.metrics.engine import (
     compute_period_performance,
     compute_unrealized_pnl,
 )
+from app.core.timeframe import CANONICAL_OPERATIONAL_TIMEFRAME, canonical_timeframe
+from app.market_data.base import CandleTick
 from app.persistence import repo
+from app.strategy.aggregator import CandleAggregator
 from app.persistence.db import session_scope
 from app.persistence.models import OperationalSession
 from app.sessions import resolve_accounting_base, resolve_starting_balance
@@ -47,6 +50,44 @@ def _environment_banner(orch) -> str:
     return _ENVIRONMENT_BANNERS.get(orch.settings.mode, _DEFAULT_BANNER)
 
 
+
+# Fase 3.2 (ajuste multiativo): o banner do card do gráfico precisa
+# refletir o MODO EFETIVO. Antes era um literal fixo no HTML dizendo
+# "PAPER LIVE MULTIATIVO" mesmo quando o processo estava em REPLAY --
+# misturava dois modos com significados completamente diferentes (um lê
+# série gravada/sintética, o outro consome mercado real e simula só a
+# execução).
+_CHART_BANNERS = {
+    RunMode.REPLAY: "REPLAY {escopo}— DADOS HISTÓRICOS/SINTÉTICOS — SEM MERCADO REAL",
+    RunMode.PAPER_LOCAL: "PAPER LOCAL {escopo}— DADOS SINTÉTICOS — SEM MERCADO E SEM ORDEM REAL",
+    RunMode.PAPER_LIVE: "PAPER LIVE {escopo}— SIMULAÇÃO LOCAL — SEM ORDEM NA CORRETORA",
+    RunMode.BYBIT_DEMO: "BYBIT DEMO — MONOATIVO — CONTA DEMO DA CORRETORA, SEM DINHEIRO REAL",
+}
+
+# Modos cuja série de candles NÃO é cotação real de mercado.
+_SYNTHETIC_DATA_MODES = (RunMode.REPLAY, RunMode.PAPER_LOCAL)
+_SYNTHETIC_DATA_DISCLAIMER = "Dados REPLAY sintéticos — sem cotação real"
+
+
+def _chart_banner(orch) -> str:
+    mode = orch.settings.mode
+    if mode == RunMode.BYBIT_DEMO:
+        # BYBIT_DEMO permanece monoativo nesta fase (Fase 3 multiativo,
+        # item 1) -- o banner nunca insinua carteira multiativo.
+        return _CHART_BANNERS[mode]
+    escopo = "MULTIATIVO " if len(orch.settings.symbols) > 1 else ""
+    return _CHART_BANNERS.get(mode, _DEFAULT_BANNER).format(escopo=escopo)
+
+
+def _data_disclaimer(orch) -> str | None:
+    """Aviso explícito de que a série exibida não é cotação real. `None`
+    nos modos que consomem mercado de verdade -- nunca um texto vazio que
+    o painel pudesse renderizar como se fosse um aviso."""
+    if orch.settings.mode in _SYNTHETIC_DATA_MODES:
+        return _SYNTHETIC_DATA_DISCLAIMER
+    return None
+
+
 def _poll_health_dict(request: Request) -> dict:
     poll_health = getattr(request.app.state, "poll_health", None)
     if poll_health is None:
@@ -56,10 +97,61 @@ def _poll_health_dict(request: Request) -> dict:
     return poll_health.as_dict()
 
 
+
+def _market_processing_status(request, orch) -> str:
+    """Fase 3.2 (item 3 da correção final do PO): "o laço de mercado está
+    processando candles?" -- um conceito, e SÓ ele. Antes o painel exibia
+    "OPERAÇÕES: ATIVAS" para representar ao mesmo tempo processo rodando e
+    autorização de entrada, o que aparecia contraditório ao lado de
+    "ESTADO OPERACIONAL: OBSERVANDO (novas entradas desativadas)".
+
+    Derivado do estado real: a saúde do motor de mercado (heartbeat do
+    poll engine) e, no multiativo, a saúde por símbolo."""
+    engine_status = _poll_health_dict(request).get("poll_loop_status")
+    if engine_status in ("PARADO", "ENCERRANDO"):
+        return engine_status
+    symbols_health = _symbols_health_dict(request, orch).get("symbols_health") or {}
+    portfolio = (symbols_health.get("portfolio") or {}).get("status")
+    if portfolio in ("PARADO", "DEGRADADO", "ENCERRANDO"):
+        return portfolio
+    if engine_status == "DEGRADADO":
+        return "DEGRADADO"
+    if engine_status in (None, "INICIANDO"):
+        return "INICIANDO"
+    return "ATIVO"
+
+
+def _new_entries_status(state) -> str:
+    """"Novas entradas estão autorizadas?" -- o outro conceito, separado.
+    Derivado exclusivamente do estado real persistido, nunca de um
+    literal."""
+    if state.kill_switch_engaged:
+        return "BLOQUEADAS_EMERGENCIA"
+    if state.trading_blocked:
+        return "BLOQUEADAS"
+    if state.operational_state == "ATIVO":
+        return "ATIVADAS"
+    return "DESATIVADAS"
+
+
 def _configured_symbols(orch) -> list[str]:
     """Fase 3 multiativo: works for both a plain `Orchestrator` (monoativo)
     and a `MultiSymbolOrchestrator` -- both expose `.settings.symbols`."""
     return list(orch.settings.symbols)
+
+
+
+def _sub_orchestrator(orch, symbol: str):
+    """O `Orchestrator` responsável por `symbol` -- o próprio objeto no
+    monoativo, ou a entrada correspondente do `MultiSymbolOrchestrator`."""
+    return orch.orchestrators[symbol] if hasattr(orch, "orchestrators") else orch
+
+
+def _strategy_state_for_symbol(orch, symbol: str) -> dict:
+    """Fase 3.2: estado estratégico (timeframe, aquecimento, integridade do
+    bucket, último candle estratégico fechado e o parcial em formação).
+    Estritamente somente-leitura: nada aqui decide nada."""
+    return _sub_orchestrator(orch, symbol).strategy_state()
 
 
 def _resolve_mark_price(orch, session, symbol: str, timeframe: str = "1m", candles=None):
@@ -157,6 +249,11 @@ def get_state(request: Request):
             "replay_done": request.app.state.replay_done,
             "environment_banner": _environment_banner(orch),
             "operational_state": state.operational_state,
+            # Fase 3.2 (item 3): DOIS conceitos separados, cada um com o
+            # seu campo -- nunca mais um "OPERAÇÕES: ATIVAS" ambíguo
+            # representando processo rodando E autorização de entrada.
+            "market_processing_status": _market_processing_status(request, orch),
+            "new_entries_status": _new_entries_status(state),
             # Fase 2, item 7.5/7.9: every independent block cause, so the
             # painel can show each one separately -- never collapsed into a
             # single opaque boolean beyond `trading_blocked` itself.
@@ -193,7 +290,21 @@ def get_symbols(request: Request):
     identity order -- lets the frontend build per-symbol cards without
     hardcoding anything."""
     orch = request.app.state.orchestrator
-    return {"symbols": _configured_symbols(orch)}
+    symbols = _configured_symbols(orch)
+    # Fase 3.2 (item 12 da decisão do PO): acréscimo ADITIVO -- a chave
+    # "symbols" continua idêntica (lista de strings), então todo consumidor
+    # anterior segue funcionando byte a byte.
+    per_symbol = {}
+    for symbol in symbols:
+        state = _strategy_state_for_symbol(orch, symbol)
+        per_symbol[symbol] = {
+            "market_data_timeframe": state["market_data_timeframe"],
+            "strategy_timeframe": state["strategy_timeframe"],
+            "strategy_timeframe_minutes": state["strategy_timeframe_minutes"],
+            "warmup": state["warmup"],
+            "bucket_integrity": state["bucket_integrity"],
+        }
+    return {"symbols": symbols, "per_symbol": per_symbol}
 
 
 @router.get("/session")
@@ -378,6 +489,39 @@ def get_metrics(request: Request):
             )
             per_symbol[symbol] = _metrics_for_trades(orch, symbol_trades, symbol_exposure, symbol_funding)
 
+        # Fase 3.2 (item 13): bloqueios pelo gate de custos, cobertura
+        # média na entrada, timeframe estratégico e buckets incompletos --
+        # tudo ADITIVO (nenhuma chave anterior mudou de nome ou de
+        # significado). As razões globais continuam recalculadas a partir
+        # dos totais globais em `_metrics_for_trades`, nunca da média
+        # simples dos percentuais por símbolo.
+        global_gate = repo.cost_gate_stats(session)
+        result["cost_gate"] = {
+            "evaluated": global_gate["evaluated"],
+            "blocked_entries": global_gate["blocked"],
+            # `None` (nunca 0.0 inventado) quando não houve nenhuma
+            # avaliação com cobertura calculável.
+            "avg_coverage_ratio_at_entry": global_gate["avg_coverage_ratio"],
+        }
+        incomplete_total = 0
+        for symbol in _configured_symbols(orch):
+            state = _strategy_state_for_symbol(orch, symbol)
+            symbol_gate = repo.cost_gate_stats(session, symbol)
+            incomplete_total += state["bucket_integrity"]["incomplete_buckets"]
+            per_symbol[symbol]["cost_gate"] = {
+                "evaluated": symbol_gate["evaluated"],
+                "blocked_entries": symbol_gate["blocked"],
+                "avg_coverage_ratio_at_entry": symbol_gate["avg_coverage_ratio"],
+            }
+            per_symbol[symbol]["strategy_timeframe"] = state["strategy_timeframe"]
+            per_symbol[symbol]["strategy_timeframe_minutes"] = state["strategy_timeframe_minutes"]
+            per_symbol[symbol]["bucket_integrity"] = state["bucket_integrity"]
+
+        first = _configured_symbols(orch)[0] if _configured_symbols(orch) else None
+        result["strategy_timeframe"] = (
+            _strategy_state_for_symbol(orch, first)["strategy_timeframe"] if first else None
+        )
+        result["incomplete_buckets"] = incomplete_total
         result["per_symbol"] = per_symbol
         return result
 
@@ -557,6 +701,19 @@ def get_portfolio_summary(request: Request, scope: str = "lifetime"):
                 "open_positions_count": comp["open_positions_count"],
                 "positions": [p.__dict__ for p in comp["unrealized"].per_position],
             }
+            # Fase 3.2 (ajuste multiativo): o preço de marcação DO SÍMBOLO,
+            # pela MESMA `_resolve_mark_price` já usada por /api/chart-data
+            # e pela equity -- nunca uma segunda implementação. Antes o
+            # painel só conseguia mostrar preço quando havia posição
+            # aberta, e a tabela "Resumo por Símbolo" exibia N/D para
+            # todos os ativos, escondendo justamente a prova de que cada
+            # série tem preço próprio. `None` continua sendo `None` quando
+            # realmente não há preço -- nunca um valor inventado nem o
+            # preço de outro símbolo.
+            mark_price, mark_source, mark_at = _resolve_mark_price(orch, session, symbol)
+            per_symbol[symbol]["mark_price"] = mark_price
+            per_symbol[symbol]["mark_price_source"] = mark_source
+            per_symbol[symbol]["mark_price_at"] = mark_at
 
         return {
             "portfolio": {
@@ -609,6 +766,60 @@ def get_positions(request: Request, symbol: str | None = None):
         ]
 
 
+
+
+def _cost_gate_summary(orch, session, symbol: str) -> dict:
+    """Fase 3.2: o contrato do gate de viabilidade líquida em vigor mais o
+    que ele já bloqueou para ESTE símbolo. `required_ratio`/`estimate_source`
+    vêm do `CostModel` realmente ligado ao motor de risco -- nunca de uma
+    cópia da configuração que pudesse divergir dele."""
+    # O `RiskEngine` é COMPARTILHADO por todos os símbolos (uma única
+    # instância em `build_orchestrator`), mas só o `Orchestrator` por
+    # símbolo o expõe como atributo -- por isso a leitura passa por
+    # `_sub_orchestrator`, nunca por `orch.risk_engine` direto (que
+    # levantaria AttributeError num MultiSymbolOrchestrator).
+    model = getattr(_sub_orchestrator(orch, symbol).risk_engine, "cost_model", None)
+    stats = repo.cost_gate_stats(session, symbol)
+    return {
+        "applied": model is not None,
+        "required_ratio": model.minimum_cost_coverage_ratio if model else None,
+        "expected_move_atr_multiple": model.expected_move_atr_multiple if model else None,
+        "estimate_source": model.source if model else None,
+        "fee_rate": model.fee_rate if model else None,
+        "slippage_bps": model.slippage_bps if model else None,
+        "evaluated": stats["evaluated"],
+        "blocked_entries": stats["blocked"],
+        "avg_coverage_ratio_at_entry": stats["avg_coverage_ratio"],
+    }
+
+
+def _strategy_candles(orch, symbol: str, candles) -> list[dict]:
+    """Reconstrói, apenas para EXIBIÇÃO, a série de candles estratégicos a
+    partir dos candles de 1 minuto já carregados para o gráfico -- mesma
+    agregação determinística usada na decisão
+    (`app/strategy/aggregator.py`), num agregador NOVO e descartável, para
+    nunca tocar no estado do agregador que está de fato operando.
+
+    Buckets incompletos entram na lista marcados (`complete=false`,
+    `partial=true`, com slots esperados/recebidos/ausentes) -- nunca
+    escondidos, nunca preenchidos."""
+    sub = _sub_orchestrator(orch, symbol)
+    replay = CandleAggregator(
+        symbol=symbol,
+        timeframe_minutes=sub.aggregator.timeframe_minutes,
+        operational_minutes=sub.aggregator.operational_minutes,
+    )
+    ticks = [
+        CandleTick(
+            symbol=c.symbol, timeframe=canonical_timeframe(c.timeframe), open_time=c.open_time,
+            open=c.open, high=c.high, low=c.low, close=c.close, volume=c.volume,
+            source=c.source, received_at=c.received_at,
+        )
+        for c in candles
+    ]
+    return [b.to_dict() for b in replay.hydrate(ticks)]
+
+
 def _strategy_config_for_symbol(orch, symbol: str) -> dict:
     """Fase 3.1 (painel gráfico): a configuração REAL entregue à
     StrategyEngine do símbolo -- funciona tanto para `Orchestrator`
@@ -637,7 +848,12 @@ def get_chart_data(request: Request, symbol: str, limit: int = 500):
     if symbol not in _configured_symbols(orch):
         raise HTTPException(status_code=404, detail=f"Símbolo não configurado: {symbol}")
     limit = max(50, min(limit, 2000))
-    timeframe = "1m"
+    # Fase 3.2 (decisão Q4 do PO): a representação canônica única, nunca um
+    # literal solto. `repo.recent_candles` aceita os aliases legados ("1")
+    # e deduplica logicamente preferindo o registro canônico, então um
+    # banco BYBIT_DEMO anterior a esta fase continua aparecendo no gráfico
+    # -- o defeito que deixava `candles: []` nesse modo.
+    timeframe = CANONICAL_OPERATIONAL_TIMEFRAME
 
     with session_scope(orch.session_factory) as session:
         from sqlalchemy import select
@@ -709,8 +925,30 @@ def get_chart_data(request: Request, symbol: str, limit: int = 500):
 
         from datetime import datetime, timezone
 
+        strategy_state = _strategy_state_for_symbol(orch, symbol)
+
         return {
             "symbol": symbol, "timeframe": timeframe,
+            # Fase 3.2: banner do MODO EFETIVO e aviso explícito quando a
+            # série não é cotação real -- o painel nunca mais decide isso
+            # sozinho a partir de um literal fixo no HTML.
+            "chart_banner": _chart_banner(orch),
+            "data_disclaimer": _data_disclaimer(orch),
+            # Fase 3.2: o gráfico OPERACIONAL de 1 minuto permanece
+            # exatamente onde estava, com o mesmo nome de campo -- a
+            # agregação é sempre acrescentada ao lado, nunca no lugar.
+            "market_data_timeframe": strategy_state["market_data_timeframe"],
+            "strategy_timeframe": strategy_state["strategy_timeframe"],
+            "strategy_timeframe_minutes": strategy_state["strategy_timeframe_minutes"],
+            "strategy_candles": _strategy_candles(orch, symbol, candles),
+            "last_strategy_candle": strategy_state["last_strategy_candle"],
+            "forming_strategy_candle": strategy_state["forming_strategy_candle"],
+            "bucket_integrity": strategy_state["bucket_integrity"],
+            "warmup": strategy_state["warmup"],
+            # Indicadores AUTORITATIVOS (lidos do engine que decide), nunca
+            # recalculados no navegador.
+            "strategy_indicators": strategy_state["indicators"],
+            "cost_gate": _cost_gate_summary(orch, session, symbol),
             "candles": [
                 {
                     "time": int(c.open_time.timestamp()), "open": c.open, "high": c.high,

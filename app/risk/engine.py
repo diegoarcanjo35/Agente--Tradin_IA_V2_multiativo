@@ -29,6 +29,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 
 from app.risk.config import RiskLimits
+from app.risk.cost_model import CostModel, evaluate_cost_gate
 from app.strategy.schemas import Signal
 
 
@@ -97,8 +98,16 @@ class RiskEvaluationResult:
 
 
 class RiskEngine:
-    def __init__(self, limits: RiskLimits | None = None):
+    def __init__(self, limits: RiskLimits | None = None, cost_model: CostModel | None = None):
+        """Fase 3.2: `cost_model` liga o gate de viabilidade líquida. É
+        opcional e default `None` -- sem ele o gate simplesmente não é
+        aplicado e isso fica REGISTRADO em `checks["cost_gate"]` como
+        `applied: false` (nunca como uma aprovação implícita disfarçada de
+        sucesso). Produção sempre passa um: `app/api/main.py::
+        build_orchestrator` o constrói a partir dos mesmos números que o
+        motor de execução realmente usa."""
         self.limits = limits or RiskLimits()
+        self.cost_model = cost_model
 
     # -- Shared gating checks used by both evaluate() and evaluate_close() ---
 
@@ -235,6 +244,23 @@ class RiskEngine:
             return reject("position_size_positive", "Tamanho de posição calculado não é positivo.")
 
         qty = position_usd / signal.observed_price
+
+        # Fase 3.2: gate de VIABILIDADE LÍQUIDA -- último check antes da
+        # aprovação, porque é o primeiro momento em que `qty` existe (o
+        # custo é financeiro, não por unidade). Aplica-se EXCLUSIVAMENTE à
+        # abertura: `evaluate_close` nunca o consulta, então uma posição
+        # aberta jamais fica presa por não "valer a pena" fechar.
+        if self.cost_model is not None:
+            gate = evaluate_cost_gate(
+                self.cost_model, signal.direction, qty, signal.observed_price, signal.atr,
+            )
+            checks["cost_gate"] = {"applied": True, **gate.detail}
+            checks["cost_coverage_ok"] = gate.approved
+            if not gate.approved:
+                return reject("cost_coverage_ok", gate.reason)
+        else:
+            checks["cost_gate"] = {"applied": False}
+
         approved_order = ApprovedOrder(
             signal_id=signal_id,
             symbol=signal.symbol,

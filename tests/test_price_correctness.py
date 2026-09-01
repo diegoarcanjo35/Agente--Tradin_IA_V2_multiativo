@@ -53,7 +53,9 @@ def make_candle(i: int, close: float, symbol="BTCUSDT") -> CandleTick:
 
 
 def build_test_orchestrator(session_factory, candles):
-    settings = Settings(mode=RunMode.REPLAY)
+    # Fase 3.2: pipeline candle-a-candle (ver nota em
+    # tests/test_bybit_demo_wiring.py::make_bybit_demo_settings).
+    settings = Settings(mode=RunMode.REPLAY, strategy_timeframe_minutes=1)
     market_data_provider = ListMarketDataProvider(candles)
     cfg = StrategyConfig(fast_period=2, slow_period=4, atr_period=2,
                           min_atr_pct_of_price=0.0, max_atr_pct_of_price=1.0)

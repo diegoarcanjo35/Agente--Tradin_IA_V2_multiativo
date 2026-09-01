@@ -258,6 +258,46 @@ class Settings(BaseSettings):
     # partida do patrimônio. Ver docs/PAINEL_FINANCEIRO.md.
     paper_starting_balance_usd: float = Field(default=1000.0)
 
+    # Fase 3.2 (decisão Q3 do PO): estimativas OPERACIONAIS de custo para
+    # BYBIT_DEMO, usadas exclusivamente pelo gate de viabilidade líquida.
+    # São valores CONFIGURADOS e declarados como estimativa -- nunca
+    # consultados da corretora, nunca apresentados como se fossem a taxa
+    # real efetivamente cobrada. Deliberadamente com nomes próprios:
+    # reaproveitar `paper_live_fee_rate`/`paper_live_slippage_bps` aqui
+    # faria BYBIT_DEMO herdar silenciosamente a configuração de um
+    # simulador, exatamente o que o PO proibiu.
+    bybit_taker_fee_rate: float = Field(default=0.00055)
+    bybit_expected_slippage_bps: float = Field(default=5.0)
+
+    # Fase 3.2: a estratégia deixa de ter sua configuração fixada em código
+    # (`StrategyConfig()` puro em app/api/main.py) e passa a ser
+    # configurável. Todos estes campos entram no snapshot E no fingerprint
+    # da sessão operacional -- mudar qualquer um encerra a sessão anterior
+    # e cria uma nova, jamais uma base contábil nova (ver
+    # app/sessions.py::resolve_accounting_base).
+    strategy_fast_period: int = Field(default=9)
+    strategy_slow_period: int = Field(default=21)
+    strategy_atr_period: int = Field(default=14)
+    strategy_min_atr_pct: float = Field(default=0.0005)
+    strategy_max_atr_pct: float = Field(default=0.05)
+    strategy_stop_loss_atr_multiple: float = Field(default=2.0)
+    strategy_take_profit_atr_multiple: float = Field(default=3.0)
+
+    # Fase 3.2 (decisão Q5 do PO): o timeframe ESTRATÉGICO. A coleta de
+    # mercado permanece fixa em 1 minuto (fonte primária, nunca substituída
+    # pela agregação); este campo decide apenas em que agregação a
+    # estratégia DECIDE. Suportados nesta fase: 1 (compatibilidade
+    # explícita com o comportamento anterior), 5 (default) e 15.
+    strategy_timeframe_minutes: int = Field(default=5)
+
+    # Fase 3.2: gate de viabilidade líquida. `minimum_cost_coverage_ratio =
+    # 3.0` é uma HIPÓTESE OPERACIONAL INICIAL, configurável -- exigir
+    # margem confortavelmente superior ao custo estimado de ida e volta.
+    # Não é um parâmetro comprovadamente otimizado nem promessa de
+    # rentabilidade alguma (ver docs/ESTRATEGIA_MULTITEMPORAL.md).
+    strategy_expected_move_atr_multiple: float = Field(default=1.0)
+    minimum_cost_coverage_ratio: float = Field(default=3.0)
+
     # Correção v1.1 #5: optional, default-OFF external AI Shadow provider.
     # SimulatedProvider remains the production default in every case --
     # this only takes effect when explicitly enabled AND an API key is
@@ -441,6 +481,79 @@ class Settings(BaseSettings):
                 f"PAPER_STARTING_BALANCE_USD deve ser maior que zero; recebido {v!r}."
             )
         return v
+
+    @field_validator(
+        "strategy_fast_period", "strategy_slow_period", "strategy_atr_period",
+    )
+    @classmethod
+    def _validate_strategy_periods(cls, v: int, info) -> int:
+        # Fase 3.2: um período zero/negativo faria `_sma`/`_atr` devolver
+        # lixo silenciosamente (divisão por zero ou janela vazia) em vez de
+        # recusar a configuração na inicialização.
+        if v <= 0:
+            raise ValueError(
+                f"{info.field_name.upper()} deve ser um inteiro positivo; recebido {v!r}."
+            )
+        return v
+
+    @field_validator(
+        "strategy_min_atr_pct", "strategy_max_atr_pct",
+        "strategy_stop_loss_atr_multiple", "strategy_take_profit_atr_multiple",
+        "strategy_expected_move_atr_multiple", "minimum_cost_coverage_ratio",
+        "bybit_taker_fee_rate", "bybit_expected_slippage_bps",
+    )
+    @classmethod
+    def _validate_strategy_and_cost_floats(cls, v: float, info) -> float:
+        # NaN/Infinity contaminariam toda a fórmula do gate de custo (e a
+        # comparação `expected_move >= custo * ratio` viraria sempre
+        # verdadeira ou sempre falsa, sem explicação). Custo/slippage podem
+        # ser ZERO (uma configuração legítima: "simulador sem custo"), mas
+        # nunca negativos; os múltiplos e a razão de cobertura precisam ser
+        # estritamente positivos.
+        if not math.isfinite(v):
+            raise ValueError(
+                f"{info.field_name.upper()} deve ser um valor finito; recebido {v!r}."
+            )
+        zero_allowed = info.field_name in (
+            "strategy_min_atr_pct", "bybit_taker_fee_rate", "bybit_expected_slippage_bps",
+        )
+        if v < 0 or (v == 0 and not zero_allowed):
+            limit = "maior ou igual a zero" if zero_allowed else "maior que zero"
+            raise ValueError(f"{info.field_name.upper()} deve ser {limit}; recebido {v!r}.")
+        return v
+
+    @field_validator("strategy_timeframe_minutes")
+    @classmethod
+    def _validate_strategy_timeframe_minutes(cls, v: int) -> int:
+        # Fase 3.2 (Q5): a MESMA lista usada por
+        # app/core/timeframe.py::minutes_to_canonical -- importada de lá,
+        # nunca duplicada aqui, para que as duas jamais divirjam.
+        from app.core.timeframe import SUPPORTED_TIMEFRAME_MINUTES
+
+        if v not in SUPPORTED_TIMEFRAME_MINUTES:
+            raise ValueError(
+                f"STRATEGY_TIMEFRAME_MINUTES inválido: {v!r}. "
+                f"Valores aceitos nesta fase: {list(SUPPORTED_TIMEFRAME_MINUTES)}."
+            )
+        return v
+
+    @model_validator(mode="after")
+    def _validate_strategy_coherence(self) -> "Settings":
+        # Fase 3.2: coerência ENTRE campos -- cada um pode ser válido
+        # isoladamente e ainda assim formar uma configuração sem sentido.
+        if self.strategy_fast_period >= self.strategy_slow_period:
+            raise ValueError(
+                "STRATEGY_FAST_PERIOD deve ser menor que STRATEGY_SLOW_PERIOD "
+                f"({self.strategy_fast_period!r} >= {self.strategy_slow_period!r}); "
+                "sem isso não existe cruzamento de médias a detectar."
+            )
+        if self.strategy_min_atr_pct >= self.strategy_max_atr_pct:
+            raise ValueError(
+                "STRATEGY_MIN_ATR_PCT deve ser menor que STRATEGY_MAX_ATR_PCT "
+                f"({self.strategy_min_atr_pct!r} >= {self.strategy_max_atr_pct!r}); "
+                "a faixa de volatilidade aceitável ficaria vazia."
+            )
+        return self
 
     @field_validator("poll_healthy_ticks_to_recover")
     @classmethod

@@ -10,12 +10,17 @@
   <div id="env-banner" class="banner">AMBIENTE DEMO — SEM DINHEIRO REAL</div>
 
   <header class="topbar">
-    <h1>Agente de Trading IA — Fase 2</h1>
+    <h1>Agente de Trading IA — V2 Multiativo</h1>
     <div class="status-chips">
       <span id="chip-op-state" class="chip chip-primary">ESTADO OPERACIONAL: --</span>
       <span id="chip-mode" class="chip">MODO: --</span>
       <span id="chip-conn" class="chip">CONEXÃO: --</span>
-      <span id="chip-trading" class="chip">OPERAÇÕES: --</span>
+      <!-- Fase 3.2: dois conceitos DISTINTOS, cada um no seu chip. O chip
+           único "OPERAÇÕES: ATIVAS" representava ao mesmo tempo o laço
+           processando candles e a autorização de entrada, o que
+           contradizia visualmente o estado OBSERVANDO ao lado. -->
+      <span id="chip-processing" class="chip">PROCESSAMENTO DE MERCADO: --</span>
+      <span id="chip-entries" class="chip">NOVAS ENTRADAS: --</span>
       <span id="chip-kill" class="chip">BLOQUEIO DE EMERGÊNCIA: --</span>
     </div>
     <div id="block-reason-line" class="block-reason-line" hidden></div>
@@ -41,11 +46,17 @@
 
     <section class="card" id="chart-card">
       <h2>Gráfico de Candles</h2>
-      <div class="chart-banner">PAPER LIVE MULTIATIVO — SIMULAÇÃO LOCAL — SEM ORDEM NA CORRETORA</div>
+      <!-- Fase 3.2: o texto vem do backend e reflete o MODO EFETIVO
+           (REPLAY / PAPER_LOCAL / PAPER_LIVE / BYBIT_DEMO). Nunca mais
+           um literal fixo que dizia "PAPER LIVE" mesmo em REPLAY. -->
+      <div id="chart-banner" class="chart-banner">CARREGANDO MODO…</div>
+      <div id="chart-data-disclaimer" class="chart-disclaimer" hidden></div>
       <div class="chart-header">
         <label for="chart-symbol-select">Símbolo:</label>
         <select id="chart-symbol-select"></select>
-        <span id="chart-timeframe" class="chip">TF: --</span>
+        <span id="chart-timeframe" class="chip">Mercado: --</span>
+        <span id="chart-strategy-timeframe" class="chip chip-strategy">Estratégia: --</span>
+        <span id="chart-warmup" class="chip">Aquecimento: --</span>
         <span id="chart-visual-price" class="chip">Preço: --</span>
         <span id="chart-status" class="chip">Status: --</span>
         <span id="chart-position-state" class="chip">SEM POSIÇÃO</span>
@@ -61,6 +72,12 @@
         <div id="chart-loading" class="chart-message">Carregando...</div>
       </div>
       <div id="chart-position-legend" class="chart-legend"></div>
+      <!-- Fase 3.2: bloco estratégico. O gráfico acima continua sendo o de
+           1 minuto (visão operacional); aqui fica, lado a lado e sempre
+           rotulado, o que a ESTRATÉGIA realmente enxerga. -->
+      <h3 class="chart-subtitle">Visão da estratégia</h3>
+      <div id="chart-strategy-grid" class="hero-grid hero-grid-compact"></div>
+      <div id="chart-strategy-note" class="chart-note"></div>
       <p class="chart-attribution">
         Gráficos por TradingView Lightweight Charts™ — <a href="https://www.tradingview.com/" target="_blank" rel="noopener">https://www.tradingview.com/</a>
         (Apache License 2.0, biblioteca servida localmente, sem CDN em tempo de execução — ver THIRD_PARTY_NOTICES.md).

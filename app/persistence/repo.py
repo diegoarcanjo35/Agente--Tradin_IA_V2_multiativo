@@ -12,6 +12,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.core.clock import utcnow
+from app.core.timeframe import canonical_timeframe, timeframe_aliases
 from app.execution.order_state import NON_TERMINAL_STATUSES, OrderStatus, validate_transition
 from app.persistence.models import (
     AccountSnapshot,
@@ -147,7 +148,14 @@ def save_candle(session: Session, symbol: str, timeframe: str, open_time: dateti
     was already persisted -- the unique constraint on `candles` is the last
     line of defense against duplicate processing (correction v1.2 #2),
     enforced via a SAVEPOINT so a concurrent duplicate never poisons the
-    whole session/transaction."""
+    whole session/transaction.
+
+    Fase 3.2 (decisão Q4 do PO): o `timeframe` é SEMPRE canonicalizado
+    antes de gravar -- todo candle novo entra como `"1m"`, nunca mais como
+    o alias `"1"` que o provider da Bybit usava. O banco legado não é
+    reescrito; a convivência é resolvida na LEITURA
+    (`recent_candles`/`get_last_candle_open_time`)."""
+    timeframe = canonical_timeframe(timeframe)
     c = Candle(
         symbol=symbol, timeframe=timeframe, open_time=open_time,
         open=open_, high=high, low=low, close=close, volume=volume, source=source,
@@ -168,10 +176,14 @@ def get_last_candle_open_time(session: Session, symbol: str, timeframe: str) -> 
     indexed) rather than a separate cursor table, so a fresh
     BybitDemoMarketDataProvider instance (e.g. after a process restart) can
     call `sync_cursor()` with this value and resume exactly where it left
-    off."""
+    off.
+
+    Fase 3.2 (Q4): considera TODOS os aliases do timeframe -- um banco que
+    já tenha candles gravados como `"1"` (antes da canonicalização)
+    continua fornecendo cursor correto, sem reescrita nem migration."""
     row = session.execute(
         select(Candle.open_time)
-        .where(Candle.symbol == symbol, Candle.timeframe == timeframe)
+        .where(Candle.symbol == symbol, Candle.timeframe.in_(timeframe_aliases(timeframe)))
         .order_by(Candle.open_time.desc())
         .limit(1)
     ).scalar_one_or_none()
@@ -186,14 +198,30 @@ def recent_candles(session: Session, symbol: str, timeframe: str, limit: int = 5
     open_time DESC LIMIT`, o que usa diretamente o índice único composto
     `uq_candle_symbol_timeframe_open_time` de `(symbol, timeframe,
     open_time)`, sem full scan) e inverte em Python para a ordem que o
-    gráfico espera."""
+    gráfico espera.
+
+    Fase 3.2 (decisão Q4 do PO): aceita todos os aliases do timeframe, de
+    modo que candles legados gravados como `"1"` continuem aparecendo. Se
+    o MESMO `open_time` existir nas duas grafias, a deduplicação é LÓGICA
+    e determinística aqui -- prevalece o registro CANÔNICO (`"1m"`), e
+    apenas UM candle é emitido para aquele instante. O banco nunca é
+    reescrito por causa disso."""
+    aliases = timeframe_aliases(timeframe)
+    canonical = aliases[0]
     rows = session.execute(
         select(Candle)
-        .where(Candle.symbol == symbol, Candle.timeframe == timeframe)
+        .where(Candle.symbol == symbol, Candle.timeframe.in_(aliases))
         .order_by(Candle.open_time.desc())
-        .limit(limit)
+        .limit(limit * len(aliases))
     ).scalars().all()
-    return list(reversed(rows))
+
+    by_open_time: dict[datetime, Candle] = {}
+    for row in rows:
+        current = by_open_time.get(row.open_time)
+        if current is None or (current.timeframe != canonical and row.timeframe == canonical):
+            by_open_time[row.open_time] = row
+    deduped = [by_open_time[k] for k in sorted(by_open_time, reverse=True)][:limit]
+    return list(reversed(deduped))
 
 
 def save_signal(session: Session, symbol: str, direction: str, justification: str,
@@ -415,6 +443,68 @@ def add_to_position(session: Session, position: Position, additional_qty: float,
     session.flush()
 
 
+def decision_snapshot_for_order(session: Session, order: Order) -> dict | None:
+    """Fase 3.2 (decisão Q2 do PO): o snapshot CONGELADO da decisão que
+    originou esta ordem, alcançado exclusivamente pela cadeia de chaves
+    estrangeiras JÁ existente e obrigatória:
+
+        Order.risk_evaluation_id -> RiskEvaluation.signal_id
+                                 -> StrategySignal.params_json
+
+    Ambas as FKs são NOT NULL (ver app/persistence/models.py), então a
+    relação é persistida e inequívoca -- nunca uma busca aproximada por
+    símbolo, preço ou janela de horário, que o PO proibiu explicitamente.
+
+    Devolve o dicionário de `params_json` do sinal (ou `None` se a ordem
+    for legada/sem snapshot -- por exemplo criada antes desta fase). O
+    chamador NUNCA deve completar um `None` lendo o `Settings` atual do
+    processo: a configuração pode ter mudado desde a decisão, e usar o
+    valor de hoje reinterpretaria uma proteção que foi definida ontem."""
+    row = session.execute(
+        select(StrategySignal.params_json)
+        .join(RiskEvaluation, RiskEvaluation.signal_id == StrategySignal.id)
+        .where(RiskEvaluation.id == order.risk_evaluation_id)
+        .limit(1)
+    ).scalar_one_or_none()
+    if row is None:
+        return None
+    try:
+        params = json.loads(row)
+    except (TypeError, ValueError):
+        return None
+    return params if isinstance(params, dict) else None
+
+
+def reanchor_position_protection(
+    session: Session, position: Position, stop_distance_per_unit: float,
+    target_distance_per_unit: float,
+) -> None:
+    """Fase 3.2 (item 9 da decisão do PO): reancora stop-loss e take-profit
+    no preço médio REAL da posição, usando as distâncias CONGELADAS na
+    decisão -- nunca um ATR recalculado com o mercado do momento do fill.
+
+        BUY:  stop = avg_entry_price - stop_distance
+              alvo = avg_entry_price + target_distance
+        SELL: stop = avg_entry_price + stop_distance
+              alvo = avg_entry_price - target_distance
+
+    Chamado após CADA fill de AUMENTO (abertura ou acréscimo). Como
+    `add_to_position` já recalculou o preço médio ponderado antes desta
+    chamada, o stop e o alvo acompanham o preço médio -- e podem, por
+    isso, MOVER-SE em qualquer direção entre fills parciais. Não são
+    monotônicos e este módulo não afirma que sejam.
+
+    Fills de REDUÇÃO/fechamento nunca chamam esta função: reduzir não é
+    uma nova entrada e não pode reancorar a proteção como se fosse."""
+    if position.side == "BUY":
+        position.stop_loss = position.avg_entry_price - stop_distance_per_unit
+        position.take_profit = position.avg_entry_price + target_distance_per_unit
+    else:
+        position.stop_loss = position.avg_entry_price + stop_distance_per_unit
+        position.take_profit = position.avg_entry_price - target_distance_per_unit
+    session.flush()
+
+
 def close_position(session: Session, position: Position, realized_pnl_delta: float,
                     closing_fee: float) -> None:
     """Fully closes the position. `realized_pnl_delta` is the P&L from this
@@ -572,6 +662,54 @@ def recent_ai_recommendations(
     if symbol is not None:
         stmt = stmt.where(AIRecommendation.symbol == symbol)
     return list(session.execute(stmt).scalars().all())
+
+
+def cost_gate_stats(
+    session: Session, symbol: str | None = None, since: datetime | None = None,
+) -> dict:
+    """Fase 3.2 (item 13 da decisão do PO): quantas entradas o gate de
+    viabilidade líquida bloqueou e qual a cobertura média de custo
+    efetivamente alcançada na avaliação.
+
+    Fonte: o próprio `RiskEvaluation.checks_json` já persistido -- nenhuma
+    coluna nova, nenhuma migration, nenhum contador paralelo que pudesse
+    divergir do que realmente foi decidido. Só entram avaliações em que o
+    gate REALMENTE rodou (`cost_gate.applied is True`); uma avaliação sem
+    gate aplicado nunca é contada como "aprovada pelo gate".
+
+    Quando não há nenhuma avaliação com cobertura calculável, a média
+    volta como `None` -- nunca um zero inventado."""
+    stmt = select(RiskEvaluation.checks_json).join(
+        StrategySignal, RiskEvaluation.signal_id == StrategySignal.id
+    )
+    if symbol is not None:
+        stmt = stmt.where(StrategySignal.symbol == symbol)
+    if since is not None:
+        stmt = stmt.where(RiskEvaluation.created_at >= since)
+
+    evaluated = 0
+    blocked = 0
+    ratios: list[float] = []
+    for raw in session.execute(stmt).scalars().all():
+        try:
+            checks = json.loads(raw)
+        except (TypeError, ValueError):
+            continue
+        gate = checks.get("cost_gate") if isinstance(checks, dict) else None
+        if not isinstance(gate, dict) or gate.get("applied") is not True:
+            continue
+        evaluated += 1
+        if gate.get("cost_coverage_ok") is False:
+            blocked += 1
+        ratio = gate.get("achieved_coverage_ratio")
+        if isinstance(ratio, (int, float)):
+            ratios.append(float(ratio))
+
+    return {
+        "evaluated": evaluated,
+        "blocked": blocked,
+        "avg_coverage_ratio": (sum(ratios) / len(ratios)) if ratios else None,
+    }
 
 
 def recent_risk_evaluations(session: Session, limit: int = 50) -> list[RiskEvaluation]:

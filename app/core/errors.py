@@ -73,3 +73,36 @@ class StartingBalanceResetBlockedError(TradingSystemError):
     Refusing to start (rather than starting in a financially ambiguous
     state) matches this codebase's existing policy for unsafe startup
     conditions (see ProductionEndpointBlockedError, MigrationError)."""
+
+
+class StrategyTimeframeChangeBlockedError(TradingSystemError):
+    """Fase 3.2 (item 10 da decisão do PO): raised at startup when
+    `Settings.strategy_timeframe_minutes` differs from the value frozen in
+    the previous operational session's snapshot AND at least one position
+    is open anywhere in the portfolio. A position opened under one
+    strategic cadence must never be silently taken over by another: its
+    stop/target were sized from the ATR of the previous timeframe, and
+    `Orchestrator._check_stop_take` would keep managing it under premises
+    that no longer hold. Same "refuse to start rather than continue in an
+    ambiguous state" policy as StartingBalanceResetBlockedError. Raised
+    BEFORE any write, so no session is ended, none is created, and no
+    partial state is persisted. Deliberately scoped to the timeframe
+    alone -- other strategy changes remain unguarded."""
+
+
+class ReplayFixtureMissingError(TradingSystemError):
+    """Fase 3.2 (correção final da auditoria do PO, item 1): raised at
+    startup when a symbol configured for REPLAY/PAPER_LOCAL has no fixture
+    of its OWN.
+
+    Until this correction, any symbol without its own file silently fell
+    back to `replay_btcusdt.json`. Documenting that the series was
+    "borrowed" did not prevent a single one of its consequences: a fake
+    price for that symbol, signals duplicated from another asset,
+    contaminated metrics, a misleading demonstration, and a symbol being
+    operated on data that belongs to a different one. There is no safe
+    fallback here -- refusing to start is the only honest option, matching
+    this codebase's existing policy for unsafe startup conditions
+    (StartingBalanceResetBlockedError, StrategyTimeframeChangeBlockedError,
+    MigrationError). Raised BEFORE the database is even opened, so no
+    session is created and no candle is ever persisted."""

@@ -14,11 +14,26 @@ const MODE_LABELS = {
 };
 const OPERATIONAL_STATE_LABELS = {
   INICIALIZANDO: "INICIALIZANDO",
-  OBSERVANDO: "OBSERVANDO (novas entradas desativadas)",
-  ATIVO: "ATIVO (novas entradas autorizadas)",
-  PAUSADO: "PAUSADO (novas entradas desativadas)",
+  OBSERVANDO: "OBSERVANDO — novas entradas desativadas",
+  ATIVO: "ATIVO — novas entradas autorizadas",
+  PAUSADO: "PAUSADO — novas entradas desativadas",
   BLOQUEADO: "BLOQUEADO",
   ENCERRANDO: "ENCERRANDO",
+};
+// Fase 3.2: "o laço está processando candles?" -- um conceito só.
+const MARKET_PROCESSING_LABELS = {
+  INICIANDO: "INICIANDO",
+  ATIVO: "ATIVO",
+  DEGRADADO: "DEGRADADO",
+  PARADO: "PARADO",
+  ENCERRANDO: "ENCERRANDO",
+};
+// Fase 3.2: "entradas novas estão autorizadas?" -- o outro conceito.
+const NEW_ENTRIES_LABELS = {
+  ATIVADAS: "ATIVADAS",
+  DESATIVADAS: "DESATIVADAS",
+  BLOQUEADAS: "BLOQUEADAS",
+  BLOQUEADAS_EMERGENCIA: "BLOQUEADAS (bloqueio de emergência)",
 };
 const POLL_STATUS_LABELS = {
   INICIANDO: "INICIANDO",
@@ -165,7 +180,13 @@ async function refreshState() {
   const s = await getJSON("/api/state");
   $("chip-mode").textContent = `MODO: ${MODE_LABELS[s.mode] || s.mode}`;
   $("chip-conn").textContent = `CONEXÃO: ${s.mode === "REPLAY" ? "offline (replay)" : "ativa"}`;
-  $("chip-trading").textContent = `OPERAÇÕES: ${s.trading_blocked ? "BLOQUEADAS" : "ATIVAS"}`;
+  // Fase 3.2: os dois chips vêm de campos DERIVADOS DO ESTADO REAL no
+  // backend (`market_processing_status`/`new_entries_status`) -- nunca de
+  // um literal, e nunca de um mesmo booleano servindo aos dois conceitos.
+  $("chip-processing").textContent =
+    `PROCESSAMENTO DE MERCADO: ${MARKET_PROCESSING_LABELS[s.market_processing_status] || s.market_processing_status || "indisponível"}`;
+  $("chip-entries").textContent =
+    `NOVAS ENTRADAS: ${NEW_ENTRIES_LABELS[s.new_entries_status] || s.new_entries_status || "indisponível"}`;
   $("chip-kill").textContent = `BLOQUEIO DE EMERGÊNCIA: ${s.kill_switch_engaged ? "ATIVADO" : "desativado"}`;
   $("chip-op-state").textContent = `ESTADO OPERACIONAL: ${OPERATIONAL_STATE_LABELS[s.operational_state] || s.operational_state}`;
   $("env-banner").textContent = s.environment_banner;
@@ -451,10 +472,14 @@ async function refreshSymbolsSummary() {
     const p = positionsBySymbol[symbol];
     const comp = perSymbolPortfolio[symbol] || {};
     const openPosition = (comp.positions || [])[0];
-    // Preço: só disponível quando há posição aberta marcada a mercado
-    // agora -- nunca o preço de outro símbolo, nunca inventado.
-    const price = openPosition && typeof openPosition.mark_price === "number"
-      ? openPosition.mark_price.toFixed(2) : "N/D";
+    // Fase 3.2: preço de marcação DO SÍMBOLO, vindo da fonte única do
+    // backend (`_resolve_mark_price`) -- disponível mesmo sem posição
+    // aberta. Continua "N/D" quando genuinamente não há preço; nunca o
+    // preço de outro símbolo, nunca inventado.
+    const markPrice = typeof comp.mark_price === "number"
+      ? comp.mark_price
+      : (openPosition && typeof openPosition.mark_price === "number" ? openPosition.mark_price : null);
+    const price = markPrice === null ? "N/D" : fmtCurrency(markPrice);
     const positionText = p
       ? `${translateDirection(p.side)} ${p.qty.toFixed(6)} @ ${p.avg_entry_price.toFixed(2)}`
       : "sem posição";
@@ -504,6 +529,71 @@ function computeSMA(candles, period) {
     out.push({ time: candles[i].time, value: sum / period });
   }
   return out;
+}
+
+// Fase 3.2: "1m" -> "1 min", "5m" -> "5 min". Nunca abrevia a ponto de
+// deixar ambíguo qual das duas cadências está sendo mostrada.
+function describeTimeframe(tf) {
+  if (!tf) return "N/D";
+  const minutes = parseInt(String(tf).replace("m", ""), 10);
+  if (!Number.isFinite(minutes)) return String(tf);
+  return `${minutes} min`;
+}
+
+// Fase 3.2: painel da visão estratégica. Todo texto via textContent
+// (statCard já garante isso) -- nenhum innerHTML em lugar nenhum.
+function renderStrategyPanel(body) {
+  const grid = $("chart-strategy-grid");
+  if (!grid) return;
+  clearChildren(grid);
+
+  const ind = body.strategy_indicators || {};
+  const last = body.last_strategy_candle;
+  const forming = body.forming_strategy_candle;
+  const integrity = body.bucket_integrity || {};
+
+  statCard(grid, `SMA rápida (${fmtInt(ind.fast_period)}) — média simples`, fmtRatioOrND(ind.fast_sma), {
+    title: "Média móvel SIMPLES (SMA) do fechamento dos candles estratégicos. Não é EMA.",
+  });
+  statCard(grid, `SMA lenta (${fmtInt(ind.slow_period)}) — média simples`, fmtRatioOrND(ind.slow_sma), {
+    title: "Média móvel SIMPLES (SMA) do fechamento dos candles estratégicos. Não é EMA.",
+  });
+  statCard(grid, "ATR (US$ por unidade)", fmtCurrency(ind.atr_per_unit_usd), {
+    title: "Amplitude média real, em dólares POR UNIDADE do ativo -- só vira dinheiro depois de multiplicada pela quantidade.",
+  });
+  statCard(grid, "ATR (% do preço)", ind.atr_pct_of_price != null ? fmtPercent(ind.atr_pct_of_price * 100) : "N/D", {
+    title: "O mesmo ATR expresso como fração do último fechamento -- é este valor que os filtros de volatilidade comparam.",
+  });
+  statCard(grid, "Último candle estratégico fechado", last ? new Date(last.open_time).toLocaleString("pt-BR") : "N/D", {
+    title: "Abertura (UTC convertida) do último bucket COMPLETO que alimentou a estratégia.",
+  });
+  statCard(grid, "Candle estratégico em formação", formingLabel(forming), {
+    cardClass: forming ? "stat-card-partial" : "",
+    title: "Bucket ainda incompleto. Exibido apenas para acompanhamento -- nunca usado para decidir.",
+  });
+  statCard(grid, "Buckets incompletos", fmtInt(integrity.incomplete_buckets), {
+    valueClass: integrity.incomplete_buckets ? "cost" : "",
+    title: "Buckets estratégicos finalizados com candles de 1 minuto faltando. Não geram sinal e nunca têm OHLCV fabricado.",
+  });
+  statCard(grid, "Cobertura de custos exigida", body.cost_gate ? fmtRatio(body.cost_gate.required_ratio) : "N/D", {
+    title: "Quantas vezes o movimento esperado precisa cobrir o custo estimado de ida e volta para uma entrada ser aprovada.",
+  });
+
+  const note = $("chart-strategy-note");
+  if (note) {
+    note.textContent = forming
+      ? `Bucket em formação: ${fmtInt(forming.received_slots)} de ${fmtInt(forming.expected_slots)} candles de 1 minuto recebidos — PARCIAL, ainda não fechado e não usado pela estratégia.`
+      : "Nenhum bucket estratégico em formação no momento.";
+  }
+}
+
+function formingLabel(forming) {
+  if (!forming) return "N/D";
+  return `PARCIAL ${fmtInt(forming.received_slots)}/${fmtInt(forming.expected_slots)}`;
+}
+
+function fmtRatioOrND(v) {
+  return typeof v === "number" && Number.isFinite(v) ? fmtCurrency(v) : "N/D";
 }
 
 function chartWindowSeconds(windowKey) {
@@ -690,7 +780,29 @@ async function refreshChart() {
     if (select.value !== requestedSymbol) return;
 
     ensureChart(symbol);
-    $("chart-timeframe").textContent = `TF: ${body.timeframe}`;
+    // Fase 3.2: banner do modo EFETIVO e aviso de dados sintéticos --
+    // ambos vindos do backend, nunca deduzidos aqui.
+    const banner = $("chart-banner");
+    if (banner && body.chart_banner) banner.textContent = body.chart_banner;
+    const disclaimer = $("chart-data-disclaimer");
+    if (disclaimer) {
+      if (body.data_disclaimer) {
+        disclaimer.textContent = body.data_disclaimer;
+        disclaimer.hidden = false;
+      } else {
+        disclaimer.textContent = "";
+        disclaimer.hidden = true;
+      }
+    }
+
+    // Fase 3.2: mercado e estratégia SEMPRE rotulados lado a lado, nunca
+    // um "TF" ambíguo que pudesse ser confundido com o outro.
+    $("chart-timeframe").textContent = `Mercado: ${describeTimeframe(body.market_data_timeframe || body.timeframe)}`;
+    $("chart-strategy-timeframe").textContent = `Estratégia: ${describeTimeframe(body.strategy_timeframe)}`;
+    const warm = body.warmup || {};
+    $("chart-warmup").textContent = warm.required != null
+      ? `Aquecimento: ${fmtInt(warm.have)}/${fmtInt(warm.required)} ${warm.ready ? "(pronto)" : "(aquecendo)"}`
+      : "Aquecimento: N/D";
     $("chart-status").textContent = `Status: ${SYMBOL_HEALTH_LABELS[(body.symbol_health || {}).status] || "indisponível"}`;
     $("chart-visual-price").textContent = body.visual_price != null
       ? `Preço: ${body.visual_price.toFixed(2)} (${body.visual_price_source === "forming_candle" ? "ao vivo (visual)" : "último fechamento"})`
@@ -701,8 +813,16 @@ async function refreshChart() {
     CHART_STATE.candleSeries.setData(candles.map((c) => ({ time: c.time, open: c.open, high: c.high, low: c.low, close: c.close })));
     CHART_STATE.volumeSeries.setData(candles.map((c) => ({ time: c.time, value: c.volume, color: c.close >= c.open ? CHART_UP_COLOR : CHART_DOWN_COLOR })));
     const cfg = body.strategy_config || { fast_period: 9, slow_period: 21 };
-    CHART_STATE.smaFastSeries.setData(computeSMA(candles, cfg.fast_period));
-    CHART_STATE.smaSlowSeries.setData(computeSMA(candles, cfg.slow_period));
+    // Fase 3.2: as médias desenhadas são as da ESTRATÉGIA -- calculadas
+    // sobre os candles estratégicos COMPLETOS (nunca sobre os de 1 minuto,
+    // que produziriam uma linha que a estratégia nunca enxergou, e nunca
+    // sobre um bucket parcial). São médias SIMPLES (SMA), jamais EMA.
+    const strategyCandles = (body.strategy_candles || []).filter((c) => c.complete);
+    const smaSource = strategyCandles.map((c) => ({
+      time: Math.floor(Date.parse(c.open_time) / 1000), close: c.close,
+    }));
+    CHART_STATE.smaFastSeries.setData(computeSMA(smaSource, cfg.fast_period));
+    CHART_STATE.smaSlowSeries.setData(computeSMA(smaSource, cfg.slow_period));
 
     const markers = (body.recent_signals || []).map((s) => ({
       time: s.time,
@@ -714,6 +834,7 @@ async function refreshChart() {
     CHART_STATE.candleSeries.setMarkers(markers);
 
     applyPositionOverlay(body.position, body.visual_price);
+    renderStrategyPanel(body);
     if (CHART_STATE.activeWindow === "all") CHART_STATE.chart.timeScale().fitContent();
     else applyChartWindow(CHART_STATE.activeWindow);
 

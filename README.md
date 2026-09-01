@@ -97,6 +97,33 @@ para a fórmula oficial, os escopos disponíveis (`lifetime`/`session`/
 `daily`) e o contrato completo da API (`GET /api/portfolio-summary`,
 `GET /api/costs`).
 
+## Estratégia multitemporal e viabilidade líquida (Fase 3.2)
+
+A **coleta** de mercado continua em candles de **1 minuto** (fonte
+primária: todo candle fechado é persistido, exibido e usado no
+acompanhamento de stop/alvo). A **decisão** da estratégia passa a
+acontecer sobre candles **agregados**, no timeframe configurado por
+`STRATEGY_TIMEFRAME_MINUTES` (1, 5 — padrão — ou 15). Um bucket fecha
+assim que todos os seus candles de 1 minuto chegam, sem esperar o período
+seguinte; um bucket ao qual falte candle é marcado como incompleto,
+exibido como tal e **nunca** alimenta a estratégia (OHLCV ausente jamais é
+fabricado).
+
+Antes de abrir posição, um **gate de viabilidade líquida** compara o
+movimento esperado (ATR × quantidade) com o custo estimado de ida e volta
+(taxas + slippage das duas pernas, cada uma com seu próprio notional). A
+entrada só é aprovada se o movimento esperado cobrir
+`MINIMUM_COST_COVERAGE_RATIO` vezes esse custo — 3,0 por padrão, uma
+**hipótese operacional inicial configurável**, não um parâmetro otimizado
+nem promessa de rentabilidade. Depois do preenchimento, stop e alvo são
+**reancorados no preço médio real** da posição, com as distâncias em ATR
+congeladas no momento da decisão.
+
+As médias são **simples (SMA 9/21)** — não existe EMA neste sistema. Ver
+`docs/ESTRATEGIA_MULTITEMPORAL.md` para a arquitetura completa, a fórmula
+auditável do gate com exemplo numérico, a hidratação silenciosa no
+reinício e as limitações conhecidas.
+
 ## Como gerar credenciais Bybit Demo Trading
 
 Ver `docs/OPERACAO_DEMO.md`.

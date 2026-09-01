@@ -18,7 +18,13 @@ from tests.test_price_correctness import ListMarketDataProvider, make_candle
 
 def _build_multi(session_factory, per_symbol_candles: dict[str, list]) -> MultiSymbolOrchestrator:
     symbols = list(per_symbol_candles)
-    settings = Settings(mode=RunMode.REPLAY, symbols=symbols)
+    settings = Settings(
+        mode=RunMode.REPLAY, symbols=symbols,
+        # Fase 3.2: round-robin/saúde por símbolo são verificados tick a
+        # tick; timeframe estratégico 1 mantém a proporção original de
+        # "um tick = uma decisão".
+        strategy_timeframe_minutes=1,
+    )
     price_state: dict[str, float] = {}
     execution_engine = PaperLocalExecutionEngine(
         price_provider=lambda s: price_state.get(s, 0.0), slippage_bps=0.0
@@ -85,7 +91,10 @@ def test_one_symbol_permanently_failing_never_starves_the_others(tmp_path):
     }
     multi = _build_multi(session_factory, candles)
     multi.orchestrators["BTCUSDT"] = Orchestrator(
-        settings=Settings(mode=RunMode.REPLAY, symbol="BTCUSDT", symbols=["BTCUSDT"]),
+        settings=Settings(
+            mode=RunMode.REPLAY, symbol="BTCUSDT", symbols=["BTCUSDT"],
+            strategy_timeframe_minutes=1,
+        ),
         session_factory=session_factory,
         market_data_provider=_AlwaysGapProvider(),
         strategy_engine=StrategyEngine(symbol="BTCUSDT"),

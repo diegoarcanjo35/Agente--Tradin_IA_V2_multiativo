@@ -1,2 +1,11 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+
+# Fase 3.2: a biblioteca gráfica de terceiros e sua licença NUNCA podem ter
+# os fins de linha reescritos no checkout. O SHA-256 registrado em
+# THIRD_PARTY_NOTICES.md é a prova de que o arquivo servido é exatamente o
+# build oficial obtido -- e `text=auto` convertia LF em CRLF na cópia de
+# trabalho no Windows, mudando os bytes e invalidando essa prova
+# (tests/test_chart_vendor_and_notices.py falhava dependendo apenas de em
+# qual branch o arquivo tinha acabado de ser extraído).
+frontend/vendor/** -text

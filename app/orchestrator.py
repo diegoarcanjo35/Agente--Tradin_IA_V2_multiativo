@@ -30,6 +30,11 @@ from datetime import datetime, time, timedelta, timezone
 from app.ai_shadow.agent import AIShadowAgent
 from app.core.clock import RemoteTimeProvider, compute_clock_sync, utcnow
 from app.core.config import Settings
+from app.core.timeframe import (
+    CANONICAL_OPERATIONAL_TIMEFRAME,
+    OPERATIONAL_TIMEFRAME_MINUTES,
+    canonical_timeframe,
+)
 from app.core.logging import get_logger, log_event
 from app.execution import fill_service
 from app.execution.base import ExecutionEngine
@@ -37,11 +42,12 @@ from app.execution.funding import FUNDING_WINDOW_SECONDS, BybitFundingProvider, 
 from app.execution.idempotency import make_idempotency_key
 from app.execution.order_state import OrderStatus, is_terminal
 from app.execution.reconciliation import reconcile_orders, reconcile_positions
-from app.market_data.base import CandleFetchStatus, MarketDataProvider
+from app.market_data.base import CandleFetchStatus, CandleTick, MarketDataProvider
 from app.persistence import repo
 from app.persistence.models import OperationalSession
 from app.risk.engine import RiskContext, RiskEngine
 from app.sessions import increment as increment_session_counter
+from app.strategy.aggregator import AggregatedCandle, CandleAggregator, to_candle_tick
 from app.strategy.engine import StrategyEngine
 
 logger = get_logger(__name__)
@@ -87,6 +93,29 @@ class Orchestrator:
         self.visual_price_state: dict[str, dict] = (
             visual_price_state if visual_price_state is not None else {}
         )
+        # Fase 3.2: agregação do candle OPERACIONAL de 1 minuto no candle
+        # ESTRATÉGICO configurado (1/5/15). Um agregador por símbolo --
+        # cada Orchestrator tem o seu, exatamente como já acontece com o
+        # StrategyEngine (estado mutável, nunca compartilhado).
+        self.aggregator = CandleAggregator(
+            symbol=settings.symbol,
+            timeframe_minutes=settings.strategy_timeframe_minutes,
+            operational_minutes=OPERATIONAL_TIMEFRAME_MINUTES,
+        )
+        # O último candle estratégico COMPLETO que realmente alimentou a
+        # estratégia -- exposto no painel, nunca usado para decidir nada.
+        self.last_strategy_candle: AggregatedCandle | None = None
+        # Fase 3.2 (item 2 da correção final do PO): um bucket estratégico
+        # finalizado INCOMPLETO significa que faltou candle de 1 minuto --
+        # existe uma lacuna de mercado, mesmo que o provider não a tenha
+        # sinalizado antes. Enquanto esta marca estiver de pé, o símbolo
+        # está degradado e NENHUMA entrada nova é aprovada (entry-only:
+        # fechar/reduzir nunca é bloqueado, o stop/alvo segue sendo
+        # avaliado a cada candle de 1 minuto e o kill-switch continua
+        # disponível). Só é limpa por um bucket COMPLETO e contíguo -- ver
+        # `tick()`. Memória de processo, como todo o resto da saúde.
+        self.strategy_gap_degraded = False
+        self._strategy_state_hydrated = False
         self._last_open_order_poll_at: datetime | None = None
         # Correção v1.1 #6: only ever set for BYBIT_DEMO (the only mode
         # with private-endpoint credentials) -- None means funding stays
@@ -237,16 +266,6 @@ class Orchestrator:
 
             self.price_state[candle.symbol] = candle.close
 
-            signal = self.strategy_engine.on_candle(candle)
-            signal_row = repo.save_signal(
-                session, signal.symbol, signal.direction, signal.justification,
-                signal.observed_price, signal.atr, signal.params,
-                source_candle_open_time=signal.source_candle_open_time,
-            )
-            increment_session_counter(op_session, "signals_count")
-
-            self._run_ai_shadow(session, state, op_session, signal, signal_row.id, candle.close)
-
             data_is_stale = self.market_data_provider.is_stale(
                 self.settings.risk_max_data_staleness_seconds
             )
@@ -261,18 +280,94 @@ class Orchestrator:
                 )
             repo.recompute_trading_blocked(state, self.settings.risk_max_api_failures)
 
+            # Fase 3.2 (item 7 da decisão do PO): stop/take das posições
+            # abertas é avaliado com o high/low do candle de 1 MINUTO e
+            # ANTES de qualquer nova decisão estratégica deste mesmo tick --
+            # uma posição que deveria ter sido encerrada nunca continua
+            # interferindo na decisão de entrada.
+            #
+            # O resultado é GUARDADO em vez de retornado imediatamente: a
+            # agregação e o `on_candle` abaixo precisam receber este candle
+            # de qualquer forma, senão um tick que dispara stop/alvo abriria
+            # um buraco permanente no bucket estratégico e na janela móvel
+            # do engine (a série ficaria com um candle a menos para sempre).
+            # A nova ENTRADA, essa sim, é abandonada logo após a agregação.
             stop_take_result = self._check_stop_take(session, state, candle, data_is_stale, clock_sync)
+
+            # Fase 3.2: o candle de 1 minuto SEMPRE alimenta o agregador --
+            # ele já foi persistido e exibido acima, e a agregação é
+            # puramente derivada.
+            aggregated = self.aggregator.push(candle)
+
+            if aggregated is None or not aggregated.complete:
+                # Bucket ainda em formação, ou finalizado INCOMPLETO (falta
+                # candle de 1 minuto). Em nenhum dos dois casos a estratégia
+                # é consultada: OHLCV ausente jamais é fabricado, e um
+                # bucket incompleto nunca decide.
+                if stop_take_result is not None:
+                    return stop_take_result
+                if aggregated is not None:
+                    # Lacuna de mercado real: o símbolo passa a DEGRADADO e
+                    # não aceita entrada nova até fechar um bucket completo.
+                    self.strategy_gap_degraded = True
+                    log_event(
+                        logger, 30, "incomplete_strategy_bucket_skipped",
+                        symbol=candle.symbol, bucket_open_time=aggregated.open_time.isoformat(),
+                        expected_slots=aggregated.expected_slots,
+                        received_slots=aggregated.received_slots,
+                        missing_slots=[t.isoformat() for t in aggregated.missing_slots],
+                    )
+                    return {
+                        "status": "incomplete_bucket",
+                        "symbol": candle.symbol,
+                        "detail": (
+                            f"Bucket estratégico {aggregated.open_time.isoformat()} finalizado com "
+                            f"{aggregated.received_slots}/{aggregated.expected_slots} candles; "
+                            "não enviado à estratégia."
+                        ),
+                    }
+                # Tick saudável de agregação (item 7 da decisão do PO):
+                # dados fluindo normalmente, apenas ainda sem candle
+                # estratégico fechado.
+                return {"status": "aggregating"}
+
+            # Bucket COMPLETO e contíguo (o agregador só finaliza em
+            # ordem): é exatamente esta a condição de recuperação exigida
+            # pelo PO -- nunca um tick qualquer, nunca um candle atrasado,
+            # nunca uma duplicata.
+            self.strategy_gap_degraded = False
+            self.last_strategy_candle = aggregated
+            strategy_candle = to_candle_tick(aggregated)
+            signal = self.strategy_engine.on_candle(strategy_candle)
+            signal_row = repo.save_signal(
+                session, signal.symbol, signal.direction, signal.justification,
+                signal.observed_price, signal.atr,
+                self._decision_snapshot(signal, aggregated),
+                source_candle_open_time=signal.source_candle_open_time,
+            )
+            increment_session_counter(op_session, "signals_count")
+
+            self._run_ai_shadow(
+                session, state, op_session, signal, signal_row.id, strategy_candle.close,
+            )
+
             if stop_take_result is not None:
+                # A posição foi encerrada por stop/alvo neste tick. O candle
+                # estratégico já foi processado e o sinal já foi registrado
+                # (histórico íntegro), mas nenhuma ENTRADA nova é avaliada
+                # aqui -- exatamente a prioridade que o PO exigiu.
+                stop_take_result["strategy_bucket_complete"] = True
                 return stop_take_result
 
             close_result = self._maybe_close_opposing_position(
                 session, state, signal, signal_row.id, data_is_stale, clock_sync
             )
             if close_result is not None:
+                close_result["strategy_bucket_complete"] = True
                 return close_result
 
             if signal.direction == "HOLD":
-                return {"status": "hold"}
+                return {"status": "hold", "strategy_bucket_complete": True}
 
             open_pos = repo.open_positions(session, signal.symbol)
             all_open = repo.open_positions(session)
@@ -299,11 +394,138 @@ class Orchestrator:
             increment_session_counter(op_session, "approvals_count" if risk_result.approved else "rejections_count")
 
             if not risk_result.approved or risk_result.approved_order is None:
-                return {"status": "rejected", "reason": risk_result.reason}
+                return {
+                    "status": "rejected", "reason": risk_result.reason,
+                    "strategy_bucket_complete": True,
+                }
 
-            return self._submit_and_record(
-                session, state, risk_row.id, risk_result.approved_order, candle.open_time, candle.close
+            submit_result = self._submit_and_record(
+                session, state, risk_row.id, risk_result.approved_order,
+                aggregated.open_time, strategy_candle.close,
             )
+            submit_result["strategy_bucket_complete"] = True
+            return submit_result
+
+    def _decision_snapshot(self, signal, aggregated: AggregatedCandle) -> dict:
+        """Fase 3.2 (decisão Q2 do PO): o snapshot CONGELADO da decisão,
+        gravado em `StrategySignal.params_json` -- a única fonte que o
+        `fill_service` consulta depois, pela cadeia de FKs
+        Order -> RiskEvaluation -> StrategySignal (ver
+        `repo.decision_snapshot_for_order`). Nada aqui é relido do
+        `Settings` no momento do fill: a configuração pode ter mudado, e a
+        proteção precisa continuar valendo pelos números que a definiram.
+
+        As distâncias de proteção são gravadas em US$ POR UNIDADE (o ATR já
+        é uma diferença de preço por unidade; multiplicá-lo pelos múltiplos
+        mantém a unidade). Só existem quando o sinal é acionável -- um HOLD
+        não tem stop nem alvo, e nada é fabricado para ele."""
+        cfg = self.strategy_engine.config
+        snapshot = dict(signal.params)
+        snapshot.update({
+            "market_data_timeframe": CANONICAL_OPERATIONAL_TIMEFRAME,
+            "strategy_timeframe": self.aggregator.timeframe,
+            "strategy_timeframe_minutes": self.aggregator.timeframe_minutes,
+            "atr_per_unit_usd": signal.atr,
+            "stop_loss_atr_multiple": cfg.stop_loss_atr_multiple,
+            "take_profit_atr_multiple": cfg.take_profit_atr_multiple,
+            "bucket": aggregated.to_dict(),
+            "bucket_complete": aggregated.complete,
+            "bucket_expected_slots": aggregated.expected_slots,
+            "bucket_received_slots": aggregated.received_slots,
+        })
+        if signal.direction in ("BUY", "SELL") and signal.atr:
+            snapshot["stop_distance_per_unit"] = signal.atr * cfg.stop_loss_atr_multiple
+            snapshot["target_distance_per_unit"] = signal.atr * cfg.take_profit_atr_multiple
+        return snapshot
+
+    # --- Hidratação silenciosa do estado estratégico (Fase 3.2) ----------
+
+    def strategy_hydration_depth(self) -> int:
+        """Quantos candles OPERACIONAIS de 1 minuto precisam ser relidos do
+        banco para restaurar integralmente o estado estratégico. Derivado
+        exclusivamente da configuração -- nunca um número fixo espalhado
+        pelo código:
+
+            (candles estratégicos exigidos pelo aquecimento + 1 bucket de
+             folga) x slots por bucket
+
+        O bucket de folga garante que o bucket PARCIAL em curso também seja
+        reconstruído, e não apenas os completos anteriores."""
+        buckets = self.strategy_engine.warmup_required() + 1
+        return buckets * self.aggregator.expected_slots
+
+    def hydrate_strategy_state(self, session) -> dict:
+        """Fase 3.2 (item 5 da decisão do PO): reconstrói, a partir dos
+        candles de 1 minuto JÁ persistidos, todo o estado estratégico que
+        uma execução contínua teria -- SMA rápida, SMA lenta, ATR,
+        `_prev_fast_above_slow` e o bucket parcial em formação.
+
+        Silenciosa por contrato: não persiste sinal, não cria ordem, não
+        incrementa contador operacional, não chama o motor de risco e não
+        produz efeito colateral nenhum. Roda uma única vez por processo
+        (`_strategy_state_hydrated`), no boot, antes do primeiro tick.
+
+        Buracos históricos permanecem buracos: os buckets são
+        reconstruídos a partir do que existe no banco, e um bucket ao qual
+        falte candle é reconstruído como INCOMPLETO -- nunca preenchido, e
+        nunca entregue ao engine."""
+        if self._strategy_state_hydrated:
+            return {"hydrated": False, "reason": "already_hydrated"}
+
+        depth = self.strategy_hydration_depth()
+        rows = repo.recent_candles(
+            session, self.settings.symbol, CANONICAL_OPERATIONAL_TIMEFRAME, limit=depth,
+        )
+        ticks = [
+            CandleTick(
+                symbol=row.symbol, timeframe=canonical_timeframe(row.timeframe),
+                open_time=row.open_time, open=row.open, high=row.high, low=row.low,
+                close=row.close, volume=row.volume, source=row.source,
+                received_at=row.received_at,
+            )
+            for row in rows
+        ]
+        buckets = self.aggregator.hydrate(ticks)
+        complete = [b for b in buckets if b.complete]
+        self.strategy_engine.hydrate([to_candle_tick(b) for b in complete])
+        if complete:
+            self.last_strategy_candle = complete[-1]
+
+        self._strategy_state_hydrated = True
+        log_event(
+            logger, 20, "strategy_state_hydrated", symbol=self.settings.symbol,
+            operational_candles=len(ticks), strategy_candles=len(complete),
+            incomplete_buckets=len(buckets) - len(complete),
+            warmup=self.strategy_engine.warmup_state(),
+        )
+        return {
+            "hydrated": True,
+            "operational_candles": len(ticks),
+            "strategy_candles": len(complete),
+            "incomplete_buckets": len(buckets) - len(complete),
+            "warmup": self.strategy_engine.warmup_state(),
+        }
+
+    def strategy_state(self) -> dict:
+        """Estado estratégico deste símbolo para painel/API -- somente
+        leitura, nunca usado para decidir."""
+        forming = self.aggregator.forming()
+        return {
+            "market_data_timeframe": CANONICAL_OPERATIONAL_TIMEFRAME,
+            "strategy_timeframe": self.aggregator.timeframe,
+            "strategy_timeframe_minutes": self.aggregator.timeframe_minutes,
+            "warmup": self.strategy_engine.warmup_state(),
+            # Indicadores AUTORITATIVOS: lidos do próprio engine, nunca
+            # recalculados numa segunda implementação (no painel, por
+            # exemplo) que pudesse divergir do que decide de verdade.
+            "indicators": self.strategy_engine.current_indicators(),
+            "bucket_integrity": self.aggregator.stats.to_dict(),
+            "last_strategy_candle": (
+                self.last_strategy_candle.to_dict() if self.last_strategy_candle else None
+            ),
+            "forming_strategy_candle": forming.to_dict() if forming else None,
+        }
+
 
     def _active_session(self, session, state) -> OperationalSession | None:
         """Fase 2, item 7.7: the OperationalSession counters are updated
@@ -338,7 +560,11 @@ class Orchestrator:
             now=utcnow(),
             reconciliation_stale=state.reconciliation_stale,
             operational_state=state.operational_state,
-            engine_degraded=self.engine_degraded,
+            # Fase 3.2: a lacuna estratégica entra pelo MESMO portão
+            # entry-only que já existia para o motor degradado -- nada de
+            # um gate novo em paralelo. Vale igualmente para monoativo,
+            # onde não existe `SymbolHealth`.
+            engine_degraded=self.engine_degraded or self.strategy_gap_degraded,
         )
 
     def _run_ai_shadow(self, session, state, op_session, signal, signal_id: int, price: float) -> None:
@@ -574,7 +800,19 @@ class Orchestrator:
 
     def _submit_and_record(self, session, state, risk_evaluation_id: int, approved,
                             open_time, candle_close: float) -> dict:
-        key = make_idempotency_key(approved, open_time.strftime("%Y%m%dT%H%M"))
+        # Fase 3.2 (item 11): `open_time` aqui é o `open_time` do BUCKET
+        # ESTRATÉGICO (não mais o do candle de 1 minuto), o que por si só já
+        # garante no máximo UMA ordem de entrada por bucket. A identidade
+        # ainda inclui timeframe estratégico + versão da estratégia +
+        # identidade da sessão operacional, para que duas configurações
+        # distintas nunca colidam no mesmo instante de relógio.
+        op_session = self._active_session(session, state)
+        key = make_idempotency_key(
+            approved, open_time.strftime("%Y%m%dT%H%M"),
+            strategy_timeframe=self.aggregator.timeframe,
+            strategy_version=(op_session.strategy_version if op_session else None),
+            session_uid=(op_session.session_uid if op_session else None),
+        )
         existing = repo.find_order_by_idempotency_key(session, key)
         if existing:
             return {"status": "duplicate_suppressed", "order_id": existing.id}
@@ -914,6 +1152,15 @@ class SymbolHealth:
     last_error: str | None = None
     eligible_again_at: datetime | None = None  # while PARADO: round-robin turn skipped until this instant
     has_gap: bool = False
+    # Fase 3.2 (item 2 da correção final do PO): DOIS contadores
+    # distintos, nunca somados num único número de "gaps". Um gap
+    # operacional (o provider viu um buraco na sequência de candles
+    # fechados) e um bucket estratégico incompleto (o agregador percebeu
+    # que faltou candle dentro da janela) são eventos diferentes -- e o
+    # mesmo buraco costuma produzir os dois, então contá-los juntos
+    # duplicaria o mesmo fato.
+    operational_gaps: int = 0
+    incomplete_strategy_buckets: int = 0
 
     def is_healthy(self) -> bool:
         return self.status == "SAUDAVEL"
@@ -930,6 +1177,8 @@ class SymbolHealth:
             ),
             "last_error": self.last_error,
             "has_gap": self.has_gap,
+            "operational_gaps": self.operational_gaps,
+            "incomplete_strategy_buckets": self.incomplete_strategy_buckets,
         }
 
 
@@ -986,6 +1235,16 @@ class MultiSymbolOrchestrator:
         return next(iter(self.orchestrators.values())).execution_engine
 
     @property
+    def risk_engine(self):
+        # Fase 3.2: mesma delegação de session_factory/execution_engine --
+        # o RiskEngine é UMA instância compartilhada por todos os símbolos
+        # (ver app/api/main.py::build_orchestrator). Exposto aqui para que
+        # um chamador que só tenha `orch` (sem saber se é um Orchestrator
+        # ou este agendador) nunca esbarre num AttributeError -- exatamente
+        # o defeito que a Fase 3.1.1 corrigiu no kill-switch.
+        return next(iter(self.orchestrators.values())).risk_engine
+
+    @property
     def funding_provider(self):
         # BYBIT_DEMO (the only mode that ever sets a real funding provider)
         # is guaranteed monoativo (Fase 3 multiativo, item 1) -- a
@@ -1006,6 +1265,22 @@ class MultiSymbolOrchestrator:
         # Fase 3.1 (painel gráfico): same sharing pattern as price_state
         # above -- one shared dict across every symbol.
         return next(iter(self.orchestrators.values())).visual_price_state
+
+    def hydrate_strategy_state(self, session) -> dict:
+        """Fase 3.2: hidrata o estado estratégico de CADA símbolo, cada um
+        com o seu próprio agregador e o seu próprio StrategyEngine (estado
+        totalmente independente -- ver `Orchestrator.__init__`). Mesma
+        superfície do `Orchestrator` homônimo, para que
+        `app/api/main.py::build_orchestrator` não precise saber qual dos
+        dois objetos tem em mãos."""
+        return {
+            symbol: orch.hydrate_strategy_state(session)
+            for symbol, orch in self.orchestrators.items()
+        }
+
+    def strategy_state(self) -> dict:
+        """Estado estratégico por símbolo, somente leitura."""
+        return {symbol: o.strategy_state() for symbol, o in self.orchestrators.items()}
 
     @property
     def engine_degraded(self) -> bool:
@@ -1056,7 +1331,16 @@ class MultiSymbolOrchestrator:
         if status in FAILURE_TICK_STATUSES:
             h.consecutive_failures += 1
             h.last_error = result.get("detail") or status
-            h.has_gap = status == "gap_detected"
+            if status == "gap_detected":
+                # Gap OPERACIONAL: o provider viu o buraco na sequência de
+                # candles fechados. Contado no seu próprio contador, nunca
+                # somado ao de buckets estratégicos incompletos (o mesmo
+                # buraco normalmente produz os dois eventos, e somá-los
+                # contaria o mesmo fato duas vezes).
+                h.has_gap = True
+                h.operational_gaps += 1
+            else:
+                h.has_gap = False
             if h.consecutive_failures >= SYMBOL_PARADO_THRESHOLD:
                 h.status = "PARADO"
                 symbol_orch = self.orchestrators[symbol]
@@ -1066,16 +1350,40 @@ class MultiSymbolOrchestrator:
                 h.status = "DEGRADADO"
             return
 
-        # Any non-failure status (hold/no_new_candle/duplicate_candle/
-        # order_*/rejected/close_*/position_*) counts as a healthy tick --
-        # data is flowing and being processed normally for this symbol.
+        # Fase 3.2 (item 2 da correção final do PO): um bucket estratégico
+        # INCOMPLETO não é falha de processamento -- o candle chegou e foi
+        # persistido -- mas É uma lacuna de mercado. O símbolo fica
+        # DEGRADADO com `has_gap=True`, o que já basta para
+        # `_portfolio_healthy()` derrubar o gate da carteira e impedir
+        # entradas novas. Deliberadamente NÃO incrementa
+        # `consecutive_failures`: um bucket incompleto, sozinho, nunca
+        # leva o símbolo a PARADO (ele continuaria perdendo turnos do
+        # round-robin, o que atrapalharia a própria recuperação).
+        h.eligible_again_at = None
+        h.last_tick_success_at = now
+        h.last_candle_persisted_at = now if status not in (
+            "no_new_candle", "duplicate_candle", "no_data",
+        ) else h.last_candle_persisted_at
+
+        if status == "incomplete_bucket":
+            h.consecutive_failures = 0
+            h.has_gap = True
+            h.incomplete_strategy_buckets += 1
+            h.last_error = result.get("detail") or status
+            h.status = "DEGRADADO"
+            return
+
+        # Recuperação: SOMENTE ao finalizar um bucket estratégico COMPLETO
+        # e contíguo. Um tick de agregação, uma duplicata ou um candle
+        # atrasado nunca limpam a lacuna.
+        if h.has_gap and not result.get("strategy_bucket_complete"):
+            h.consecutive_failures = 0
+            h.status = "DEGRADADO"
+            return
+
         h.consecutive_failures = 0
         h.last_error = None
         h.has_gap = False
-        h.eligible_again_at = None
-        h.last_tick_success_at = now
-        if status not in ("no_new_candle", "duplicate_candle", "no_data"):
-            h.last_candle_persisted_at = now
         h.status = "SAUDAVEL"
 
     def tick(self) -> dict:

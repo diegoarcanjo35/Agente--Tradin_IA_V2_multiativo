@@ -51,7 +51,12 @@ def test_kill_switch_buttons_are_in_portuguese():
 
 def test_status_chip_labels_are_in_portuguese():
     js = _frontend_sources()["app.js"]
-    assert "OPERAÇÕES:" in js
+    # Fase 3.2: o chip único "OPERAÇÕES:" foi separado em DOIS conceitos --
+    # o laço processando candles e a autorização de entradas -- porque um
+    # rótulo só para os dois aparecia contraditório ao lado do estado
+    # OBSERVANDO.
+    assert "PROCESSAMENTO DE MERCADO:" in js
+    assert "NOVAS ENTRADAS:" in js
     assert "BLOQUEIO DE EMERGÊNCIA:" in js
 
 

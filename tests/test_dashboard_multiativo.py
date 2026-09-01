@@ -29,7 +29,12 @@ def _make_client(tmp_path, name, symbols):
 def test_symbols_endpoint_lists_configured_symbols_in_order(tmp_path):
     client, _ = _make_client(tmp_path, "symbols.db", "BTCUSDT,ETHUSDT,SOLUSDT")
     body = client.get("/api/symbols").json()
-    assert body == {"symbols": ["BTCUSDT", "ETHUSDT", "SOLUSDT"]}
+    # Fase 3.2: a chave "symbols" continua IDÊNTICA (a garantia de
+    # compatibilidade); `per_symbol` é acréscimo aditivo com timeframe,
+    # aquecimento e integridade de bucket.
+    assert body["symbols"] == ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
+    assert set(body["per_symbol"]) == {"BTCUSDT", "ETHUSDT", "SOLUSDT"}
+    assert body["per_symbol"]["BTCUSDT"]["market_data_timeframe"] == "1m"
 
 
 def test_state_endpoint_exposes_symbols_health_for_three_symbols(tmp_path):

@@ -26,6 +26,41 @@ class FillApplicationResult:
     closed_fully: bool | None = None  # None when is_close=False or no fill applied yet
 
 
+
+def _frozen_protection_distances(session, order: Order) -> tuple[float, float] | None:
+    """As distâncias de stop e alvo POR UNIDADE congeladas no snapshot da
+    decisão (`StrategySignal.params_json`, gravado por
+    `app/orchestrator.py` no momento em que o sinal nasceu).
+
+    Devolve `None` -- e a proteção fica exatamente como o `Order` a
+    trouxe, o comportamento anterior a esta fase -- quando a ordem é
+    legada (criada antes do snapshot existir) ou quando o snapshot não
+    tem as duas distâncias. Nunca completa a lacuna lendo a configuração
+    atual do processo: o `Settings` de hoje pode não ser o que definiu
+    aquela proteção."""
+    snapshot = repo.decision_snapshot_for_order(session, order)
+    if not snapshot:
+        return None
+    stop = snapshot.get("stop_distance_per_unit")
+    target = snapshot.get("target_distance_per_unit")
+    if not isinstance(stop, (int, float)) or not isinstance(target, (int, float)):
+        return None
+    if not (stop > 0 and target > 0):
+        return None
+    return float(stop), float(target)
+
+
+def _reanchor(session, position, protection: tuple[float, float] | None) -> None:
+    """Reancora a proteção no preço médio real -- só para fills de
+    AUMENTO. Um fill oposto BLOQUEADO (nunca aplicado à posição) e um fill
+    de fechamento sem posição local jamais chegam aqui, então nunca criam
+    nem alteram proteção."""
+    if protection is None or position is None:
+        return
+    stop_distance, target_distance = protection
+    repo.reanchor_position_protection(session, position, stop_distance, target_distance)
+
+
 def apply_order_snapshot(
     session, state: SystemState, op_session: OperationalSession | None, order: Order,
     snapshot: OrderStatusSnapshot, is_close: bool, max_api_failures: int,
@@ -100,6 +135,12 @@ def apply_order_snapshot(
         increment_session_counter(op_session, "fills_count", by=len(new_rows))
         existing = repo.open_positions(session, order.symbol)
         position = existing[0] if existing else None
+        # Fase 3.2 (item 9 da decisão do PO): distâncias de proteção
+        # CONGELADAS na decisão, lidas UMA vez pela cadeia de FKs
+        # Order -> RiskEvaluation -> StrategySignal. Nunca do `Settings`
+        # atual do processo (que pode ter mudado desde a decisão), nunca
+        # de um ATR recalculado agora.
+        protection = _frozen_protection_distances(session, order)
 
         for row in new_rows:
             if not is_close:
@@ -108,6 +149,7 @@ def apply_order_snapshot(
                         session, order.symbol, order.side, row.fill_qty, row.fill_price,
                         order.stop_loss, order.take_profit, opening_fee=row.fee,
                     )
+                    _reanchor(session, position, protection)
                 elif position.side != order.side:
                     # Correção v1.2 #5: a late/opposite fill -- e.g. the
                     # position already flipped/closed by the time this fill
@@ -122,6 +164,13 @@ def apply_order_snapshot(
                     repo.record_security_event(session, "LATE_OPPOSITE_FILL_BLOCKED", detail)
                 else:
                     repo.add_to_position(session, position, row.fill_qty, row.fill_price, row.fee)
+                    # Fill de AUMENTO: `add_to_position` acabou de
+                    # recalcular o preço médio ponderado, então a proteção
+                    # é reancorada sobre ele. Repetido a cada novo fill de
+                    # aumento -- stop/alvo acompanham o preço médio e
+                    # podem se mover em qualquer direção entre fills
+                    # parciais (não são monotônicos).
+                    _reanchor(session, position, protection)
             else:
                 if position is None:
                     # Nothing local to reduce/close -- reconciliation is what

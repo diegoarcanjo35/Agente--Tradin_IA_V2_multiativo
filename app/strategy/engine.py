@@ -1,6 +1,20 @@
-"""Deterministic, auditable strategy: moving-average crossover, gated by a
-trend filter and an ATR-based volatility filter. No ML, no black box -- every
-signal carries the exact numbers that produced it.
+"""Deterministic, auditable strategy: SIMPLE moving-average (SMA) crossover,
+gated by an ATR-based volatility band. No ML, no black box -- every signal
+carries the exact numbers that produced it.
+
+Correção da Fase 3.2 (documentação vs. código): este docstring afirmava
+existir também um "trend filter" separado. Não existe e nunca existiu -- o
+único gatilho de direção é o próprio cruzamento das duas SMAs (ver
+`on_candle`), e o único filtro é a faixa de ATR%. As médias são SIMPLES
+(`_sma`), nunca exponenciais: nada aqui calcula EMA, e nada no painel pode
+chamá-las de EMA.
+
+Fase 3.2: o engine continua sem NENHUMA dependência de timeframe -- ele
+apenas consome `CandleTick`. Quem decide se o candle recebido é de 1, 5 ou
+15 minutos é `app/strategy/aggregator.py`, fora daqui. `StrategyConfig.
+timeframe_minutes` existe só para que o valor entre no fingerprint da
+sessão junto com o resto da configuração de estratégia realmente entregue
+aos engines.
 
 This strategy makes no promise of profitability; see docs/OPERACAO_DEMO.md.
 """
@@ -22,6 +36,12 @@ class StrategyConfig:
     max_atr_pct_of_price: float = 0.05  # above this, market judged too volatile to trade
     stop_loss_atr_multiple: float = 2.0
     take_profit_atr_multiple: float = 3.0
+    # Fase 3.2: o timeframe ESTRATÉGICO em minutos (1/5/15). Não é usado em
+    # nenhum cálculo deste módulo -- vive aqui para viajar junto com o
+    # resto da configuração real da estratégia para dentro do fingerprint
+    # da sessão (`app/sessions.py::_config_fingerprint` usa
+    # `dataclasses.asdict(strategy_config)`).
+    timeframe_minutes: int = 5
 
 
 class StrategyEngine:
@@ -32,6 +52,94 @@ class StrategyEngine:
         self._highs: list[float] = []
         self._lows: list[float] = []
         self._prev_fast_above_slow: bool | None = None
+
+    # --- aquecimento e hidratação (Fase 3.2) ------------------------------
+
+    def warmup_required(self) -> int:
+        """Quantos candles ESTRATÉGICOS completos são necessários para que
+        o engine possa emitir um sinal não-HOLD. Derivado exclusivamente da
+        configuração -- nunca um número fixo espalhado pelo código.
+
+        `slow_period` closes para a SMA lenta; `atr_period + 1` closes para
+        o ATR (`_atr` olha `self._closes[i-1]`); e mais UM candle para que
+        `_prev_fast_above_slow` já esteja definido -- sem ele o primeiro
+        candle após o aquecimento nunca poderia detectar um cruzamento
+        (`on_candle` exige `_prev_fast_above_slow is not None`)."""
+        cfg = self.config
+        return max(cfg.slow_period, cfg.fast_period, cfg.atr_period + 1) + 1
+
+    def warmup_state(self) -> dict:
+        """Estado de aquecimento para painel/API -- sempre com o que é
+        exigido e o que já se tem, nunca só um booleano opaco."""
+        required = self.warmup_required()
+        have = len(self._closes)
+        return {"required": required, "have": have, "ready": have >= required}
+
+    def current_indicators(self) -> dict:
+        """Os indicadores no estado ATUAL do engine -- exatamente os
+        números que a próxima decisão usaria. Existe para que o painel
+        exiba o valor AUTORITATIVO (o do engine) em vez de recalcular a
+        matemática numa segunda implementação que pudesse divergir.
+
+        `None` em qualquer campo significa "ainda não calculável" (histórico
+        insuficiente) -- nunca um zero fabricado. `atr_pct_of_price` é o
+        ATR dividido pelo último fechamento; `atr_per_unit_usd` é a
+        diferença de preço POR UNIDADE, a mesma unidade usada pelo gate de
+        custo antes de multiplicar por `qty`."""
+        cfg = self.config
+        fast = self._sma(self._closes, cfg.fast_period)
+        slow = self._sma(self._closes, cfg.slow_period)
+        atr = self._atr()
+        last_close = self._closes[-1] if self._closes else None
+        atr_pct = (
+            atr / last_close if atr is not None and last_close else None
+        )
+        return {
+            "fast_period": cfg.fast_period,
+            "slow_period": cfg.slow_period,
+            "atr_period": cfg.atr_period,
+            "fast_sma": fast,
+            "slow_sma": slow,
+            "atr_per_unit_usd": atr,
+            "atr_pct_of_price": atr_pct,
+            "last_close": last_close,
+            "prev_fast_above_slow": self._prev_fast_above_slow,
+        }
+
+    def hydrate(self, candles: list[CandleTick]) -> None:
+        """Fase 3.2 (item 5 da decisão do PO): replay SILENCIOSO do estado
+        estratégico a partir de candles já persistidos, usado no
+        boot/restart.
+
+        Restaura integralmente o que uma execução contínua teria: as séries
+        de closes/highs/lows (base da SMA rápida, da SMA lenta e do ATR) e
+        o `_prev_fast_above_slow` -- sem o qual o primeiro candle após um
+        restart nunca detectaria um cruzamento, e o sistema silenciosamente
+        perderia entradas.
+
+        Silenciosa por construção: NÃO retorna sinal, não persiste nada,
+        não cria ordem, não incrementa contador operacional, não chama
+        risco. É o mesmo cálculo de estado que `on_candle` faz, sem
+        nenhum dos efeitos.
+
+        Idempotente em relação ao histórico: chamar com o mesmo conjunto de
+        candles a partir de um engine novo produz exatamente o mesmo
+        estado. Buracos históricos permanecem buracos -- este método
+        consome apenas o que lhe for entregue e nunca fabrica um candle
+        ausente."""
+        cfg = self.config
+        for candle in candles:
+            self._closes.append(candle.close)
+            self._highs.append(candle.high)
+            self._lows.append(candle.low)
+            fast = self._sma(self._closes, cfg.fast_period)
+            slow = self._sma(self._closes, cfg.slow_period)
+            # Exatamente a mesma regra aplicada em TODOS os caminhos de
+            # `on_candle` (aquecimento, filtros de ATR e caminho normal):
+            # indefinido enquanto qualquer uma das médias não existir.
+            self._prev_fast_above_slow = (
+                None if fast is None or slow is None else fast > slow
+            )
 
     def _sma(self, values: list[float], period: int) -> float | None:
         if len(values) < period:

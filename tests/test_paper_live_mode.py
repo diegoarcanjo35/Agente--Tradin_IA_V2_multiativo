@@ -26,6 +26,11 @@ def make_paper_live_settings(**overrides) -> Settings:
         bybit_ws_url="wss://stream-demo.bybit.com",
         database_url="sqlite:///:memory:",
         symbol="BTCUSDT",
+        # Fase 3.2: este teste exercita o pipeline OPERACIONAL "um candle
+        # -> uma decisão". O default do timeframe estratégico passou a ser
+        # 5 minutos; 1 minuto é a compatibilidade explícita mantida pelo PO
+        # e preserva exatamente a intenção original do teste.
+        strategy_timeframe_minutes=1,
     )
     defaults.update(overrides)
     return Settings(**defaults)

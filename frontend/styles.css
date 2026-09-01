@@ -292,3 +292,41 @@ html, body { max-width: 100%; overflow-x: hidden; }
   table { font-size: 12px; }
   th, td { padding: 5px 6px; }
 }
+
+/* Fase 3.2: distinção visual explícita entre a cadência de MERCADO
+   (1 min, operacional) e a de ESTRATÉGIA (5/15 min, decisão) -- nunca
+   apenas por cor: os dois chips sempre trazem o rótulo por extenso. */
+.chip-strategy {
+  border-color: #6aa9ff;
+  color: #cfe3ff;
+}
+
+.chart-subtitle {
+  margin: 1rem 0 0.5rem;
+  font-size: 0.95rem;
+  color: var(--muted, #9aa4b2);
+}
+
+.chart-note {
+  margin-top: 0.5rem;
+  font-size: 0.85rem;
+  color: var(--muted, #9aa4b2);
+}
+
+/* Um bucket ainda em formação nunca pode ser lido como fechado: além do
+   texto "PARCIAL n/N", recebe borda tracejada. */
+.stat-card-partial {
+  border-style: dashed;
+  border-color: #b98a2a;
+}
+
+/* Fase 3.2: aviso de que a série exibida NÃO é cotação real. Texto
+   explícito, nunca apenas uma cor. */
+.chart-disclaimer {
+  margin-top: 6px;
+  padding: 6px 10px;
+  border: 1px dashed #b98a2a;
+  border-radius: 6px;
+  color: #e8c86a;
+  font-size: 0.85rem;
+}

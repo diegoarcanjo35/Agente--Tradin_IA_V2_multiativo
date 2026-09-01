@@ -87,7 +87,15 @@ def test_orchestrator_loop_never_reports_no_data_for_transitory_failures(session
         http_get=fake_get, sleep=lambda s: None, now_fn=lambda: fixed_now,
     )
 
-    settings = Settings(mode=RunMode.BYBIT_DEMO, bybit_api_key="k", bybit_api_secret="s")
+    settings = Settings(
+        mode=RunMode.BYBIT_DEMO, bybit_api_key="k", bybit_api_secret="s",
+        # Fase 3.2: este teste exercita o pipeline OPERACIONAL "um candle
+        # -> um sinal". Com o novo default (5 min) um único candle apenas
+        # agrega; o timeframe estratégico de 1 minuto é a compatibilidade
+        # explícita mantida pelo PO e preserva exatamente a intenção
+        # original do teste.
+        strategy_timeframe_minutes=1,
+    )
     price_state: dict[str, float] = {}
     orch = Orchestrator(
         settings=settings, session_factory=session_factory,
@@ -173,21 +181,32 @@ def test_candle_becomes_available_once_its_period_has_elapsed():
 def test_db_unique_constraint_prevents_duplicate_candle_rows(db_session):
     """Defense in depth beyond provider-level dedup: even if the same
     symbol+timeframe+open_time is submitted twice, save_candle() must not
-    raise and must not create a second row."""
+    raise and must not create a second row.
+
+    Fase 3.2 (decisão Q4 do PO): a gravação passa a ser CANONICALIZADA --
+    o alias legado "1" (o formato de intervalo da Bybit) continua aceito
+    na entrada, mas a linha persistida é sempre "1m". A deduplicação vale
+    entre as duas grafias, porque ambas convergem para a mesma linha."""
     open_time = datetime(2024, 1, 1, tzinfo=timezone.utc)
     first = repo.save_candle(db_session, "BTCUSDT", "1", open_time, 100, 101, 99, 100.5, 10, "bybit_demo")
     assert first is not None
+    assert first.timeframe == "1m"  # canonicalizado na escrita, nunca "1"
 
     second = repo.save_candle(db_session, "BTCUSDT", "1", open_time, 100, 101, 99, 100.5, 10, "bybit_demo")
-    assert second is None  # duplicate, not an exception, not a new row
+    assert second is None  # duplicata, não exceção, não segunda linha
+
+    # A mesma vela enviada já na grafia canônica também é duplicata.
+    third = repo.save_candle(db_session, "BTCUSDT", "1m", open_time, 100, 101, 99, 100.5, 10, "bybit_demo")
+    assert third is None
 
     from sqlalchemy import select
     from app.persistence.models import Candle
 
     rows = db_session.execute(
-        select(Candle).where(Candle.symbol == "BTCUSDT", Candle.timeframe == "1", Candle.open_time == open_time)
+        select(Candle).where(Candle.symbol == "BTCUSDT", Candle.open_time == open_time)
     ).scalars().all()
     assert len(rows) == 1
+    assert rows[0].timeframe == "1m"
 
 
 def test_orchestrator_skips_signal_ai_and_risk_for_a_duplicate_candle(session_factory):
@@ -218,7 +237,15 @@ def test_orchestrator_skips_signal_ai_and_risk_for_a_duplicate_candle(session_fa
     # own dedup, to prove the DB-level guard in the orchestrator also holds.
     market_data_provider._last_processed_open_time = None
 
-    settings = Settings(mode=RunMode.BYBIT_DEMO, bybit_api_key="k", bybit_api_secret="s")
+    settings = Settings(
+        mode=RunMode.BYBIT_DEMO, bybit_api_key="k", bybit_api_secret="s",
+        # Fase 3.2: este teste exercita o pipeline OPERACIONAL "um candle
+        # -> um sinal". Com o novo default (5 min) um único candle apenas
+        # agrega; o timeframe estratégico de 1 minuto é a compatibilidade
+        # explícita mantida pelo PO e preserva exatamente a intenção
+        # original do teste.
+        strategy_timeframe_minutes=1,
+    )
     price_state: dict[str, float] = {}
     orch = Orchestrator(
         settings=settings, session_factory=session_factory,

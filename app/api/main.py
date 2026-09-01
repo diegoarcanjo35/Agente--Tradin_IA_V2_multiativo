@@ -23,6 +23,13 @@ from app.orchestrator import MultiSymbolOrchestrator, Orchestrator
 from app.persistence.db import init_db, make_engine, make_session_factory, session_scope
 from app.persistence import repo
 from app.persistence.models import OperationalSession
+from app.core.errors import ReplayFixtureMissingError
+from app.core.timeframe import CANONICAL_OPERATIONAL_TIMEFRAME, bybit_interval
+from app.risk.cost_model import (
+    SOURCE_BYBIT_DEMO_ESTIMATE,
+    SOURCE_PAPER_CONFIG,
+    CostModel,
+)
 from app.risk.engine import RiskEngine
 from app.risk.config import RiskLimits
 from app.sessions import end_session, start_or_resume_session
@@ -130,6 +137,50 @@ def _build_shared_execution_pipeline(settings, price_provider, bybit_transport):
     return execution_engine, clock_provider, funding_provider, transport
 
 
+
+def replay_fixture_for(symbol: str):
+    """Fase 3.2 (correção final da auditoria do PO, item 1): a fixture de
+    REPLAY **do símbolo**, obrigatoriamente própria.
+
+    Cada símbolo lê `fixtures/replay_<simbolo>.json` -- dados 100%
+    SINTÉTICOS gerados por `fixtures/generate_replay_fixture.py`. NÃO
+    existe fallback: um símbolo sem fixture própria levanta
+    `ReplayFixtureMissingError` em vez de emprestar a série de outro
+    ativo.
+
+    O fallback anterior (qualquer símbolo caía em `replay_btcusdt.json`)
+    era inaceitável numa plataforma multiativo: produzia preço falso para
+    o símbolo, sinais duplicados de outro ativo, métricas contaminadas e
+    uma demonstração enganosa. Documentar que a série era "emprestada"
+    não evitava nenhuma dessas consequências.
+
+    A compatibilidade monoativa histórica (`SYMBOL=BTCUSDT`) segue
+    naturalmente atendida pela própria fixture do BTC, sem precisar de
+    fallback genérico."""
+    candidate = FIXTURES_DIR / f"replay_{symbol.lower()}.json"
+    if not candidate.exists():
+        raise ReplayFixtureMissingError(
+            f"Nenhuma fixture de REPLAY para o símbolo {symbol}. Cada símbolo configurado em "
+            f"REPLAY/PAPER_LOCAL precisa da SUA própria série -- nunca a de outro ativo. "
+            f"Arquivo esperado: {candidate}. Gere-o com fixtures/generate_replay_fixture.py "
+            "(dados sintéticos) ou remova o símbolo da configuração. Nenhuma alteração foi feita."
+        )
+    return candidate
+
+
+def assert_replay_fixtures_available(settings) -> None:
+    """Valida TODOS os símbolos configurados de uma vez, no primeiro
+    instante de `build_orchestrator` -- antes de abrir o banco, antes de
+    criar/retomar sessão operacional e antes de qualquer candle ser
+    persistido. Uma carteira em que UM símbolo não tem fixture falha
+    inteira: nunca sobe pela metade, operando alguns símbolos e deixando
+    outro com dados de terceiros."""
+    if settings.mode not in (RunMode.REPLAY, RunMode.PAPER_LOCAL):
+        return
+    for symbol in settings.symbols:
+        replay_fixture_for(symbol)
+
+
 def _build_market_data_provider(settings, symbol: str, transport):
     """One instance per symbol (unlike the shared execution pipeline above)
     -- each symbol's backlog/cursor/staleness/gap state must be fully
@@ -139,13 +190,52 @@ def _build_market_data_provider(settings, symbol: str, transport):
     every symbol's provider reuses one HTTP client/connection rather than
     opening N."""
     if settings.mode in (RunMode.REPLAY, RunMode.PAPER_LOCAL):
-        return ReplayMarketDataProvider(FIXTURES_DIR / "replay_btcusdt.json", symbol=symbol)
+        return ReplayMarketDataProvider(replay_fixture_for(symbol), symbol=symbol)
 
     from app.market_data.bybit_provider import BybitDemoMarketDataProvider
 
+    # Fase 3.2 (decisão Q4 do PO): o formato de intervalo da Bybit ("1")
+    # fica confinado à fronteira HTTP, derivado da representação canônica
+    # -- nunca mais um literal solto que divergia do "1m" gravado pelo
+    # provider de REPLAY e consultado pelo painel.
     return BybitDemoMarketDataProvider(
-        settings.bybit_base_url, symbol, "1", http_get=transport.http_get,
+        settings.bybit_base_url, symbol,
+        bybit_interval(CANONICAL_OPERATIONAL_TIMEFRAME),
+        http_get=transport.http_get,
         initial_start=settings.market_data_initial_start,
+    )
+
+
+
+def build_cost_model(settings, execution_engine) -> CostModel:
+    """Fase 3.2 (decisão Q3 do PO): os parâmetros de custo em vigor.
+
+    - REPLAY / PAPER_LOCAL / PAPER_LIVE: lidos do PRÓPRIO motor de execução
+      (`fee_rate`/`slippage_bps` de `PaperLocalExecutionEngine`), que é
+      quem realmente aplica esses números em cada fill simulado. A
+      estimativa é, portanto, EXATA por construção -- e nunca pode divergir
+      do simulador, porque é o mesmo objeto. Origem declarada:
+      `paper_config`.
+    - BYBIT_DEMO: `bybit_taker_fee_rate`/`bybit_expected_slippage_bps`,
+      campos próprios e explicitamente declarados como ESTIMATIVA
+      OPERACIONAL CONFIGURADA -- nunca consultados da corretora, nunca
+      reaproveitando os nomes do simulador PAPER. Origem declarada:
+      `bybit_demo_estimate`.
+    """
+    fee_rate = getattr(execution_engine, "fee_rate", None)
+    slippage_bps = getattr(execution_engine, "slippage_bps", None)
+    if fee_rate is not None and slippage_bps is not None:
+        source = SOURCE_PAPER_CONFIG
+    else:
+        fee_rate = settings.bybit_taker_fee_rate
+        slippage_bps = settings.bybit_expected_slippage_bps
+        source = SOURCE_BYBIT_DEMO_ESTIMATE
+    return CostModel(
+        fee_rate=float(fee_rate),
+        slippage_bps=float(slippage_bps),
+        source=source,
+        expected_move_atr_multiple=settings.strategy_expected_move_atr_multiple,
+        minimum_cost_coverage_ratio=settings.minimum_cost_coverage_ratio,
     )
 
 
@@ -167,6 +257,11 @@ def build_orchestrator(settings, bybit_transport=None) -> Orchestrator | MultiSy
     `.tick()` / `.engine_degraded` / `.reconcile()` surface, so nothing
     downstream (poll_engine.py, the shutdown path) needs to know which one
     it has."""
+    # Fase 3.2 (item 1 da correção final): fixtures de REPLAY conferidas
+    # ANTES de abrir o banco -- a falha acontece sem criar sessão, sem
+    # persistir candle e sem deixar estado parcial nenhum.
+    assert_replay_fixtures_available(settings)
+
     engine = make_engine(settings.database_url)
     init_db(engine)
     session_factory = make_session_factory(engine)
@@ -188,7 +283,11 @@ def build_orchestrator(settings, bybit_transport=None) -> Orchestrator | MultiSy
     # positions regardless of symbol, unfiltered -- see
     # Orchestrator.tick()). One RiskEngine instance is stateless per call,
     # safe to share.
-    risk_engine = RiskEngine(limits=risk_limits)
+    # Fase 3.2: o gate de viabilidade líquida usa EXATAMENTE os números
+    # que o motor de execução realmente aplica (quando ele os expõe), ou a
+    # estimativa declarada de BYBIT_DEMO -- nunca uma terceira cópia que
+    # pudesse divergir das duas.
+    risk_engine = RiskEngine(limits=risk_limits, cost_model=None)
 
     # Single source of truth for "the price of the candle currently driving
     # the decision", already keyed by symbol -- the orchestrator writes it
@@ -209,6 +308,7 @@ def build_orchestrator(settings, bybit_transport=None) -> Orchestrator | MultiSy
     execution_engine, clock_provider, funding_provider, transport = _build_shared_execution_pipeline(
         settings, price_provider, bybit_transport
     )
+    risk_engine.cost_model = build_cost_model(settings, execution_engine)
 
     # Correção v1.1 #5: SimulatedProvider stays the default in every case;
     # only a deliberate, fully-configured opt-in (toggle ON AND both the
@@ -238,7 +338,21 @@ def build_orchestrator(settings, bybit_transport=None) -> Orchestrator | MultiSy
     # `dataclasses.asdict()` of the EXACT object actually driving every
     # engine, never a hand-duplicated list of fields that could drift from
     # what the strategy really uses.
-    strategy_config = StrategyConfig()
+    # Fase 3.2: a configuração de estratégia deixa de ser um
+    # `StrategyConfig()` puro (defaults fixados em código) e passa a vir
+    # inteiramente do `Settings` -- é ESTE objeto que alimenta cada
+    # StrategyEngine E o fingerprint da sessão, então os dois nunca podem
+    # divergir.
+    strategy_config = StrategyConfig(
+        fast_period=settings.strategy_fast_period,
+        slow_period=settings.strategy_slow_period,
+        atr_period=settings.strategy_atr_period,
+        min_atr_pct_of_price=settings.strategy_min_atr_pct,
+        max_atr_pct_of_price=settings.strategy_max_atr_pct,
+        stop_loss_atr_multiple=settings.strategy_stop_loss_atr_multiple,
+        take_profit_atr_multiple=settings.strategy_take_profit_atr_multiple,
+        timeframe_minutes=settings.strategy_timeframe_minutes,
+    )
 
     # Fase 3 multiativo: one `Orchestrator` per configured symbol, each
     # with its OWN market data provider + StrategyEngine (never shared --
@@ -292,6 +406,15 @@ def build_orchestrator(settings, bybit_transport=None) -> Orchestrator | MultiSy
         # how clean the startup reconciliation was.
         op_session = start_or_resume_session(session, settings, STRATEGY_VERSION, risk_limits, strategy_config)
         state.active_session_id = op_session.id
+
+        # Fase 3.2 (item 5 da decisão do PO): replay SILENCIOSO do estado
+        # estratégico a partir dos candles de 1 minuto já persistidos --
+        # SMA rápida/lenta, ATR, estado do cruzamento e o bucket parcial em
+        # curso. Sem isso, um restart no meio de um bucket (ou depois de 20
+        # buckets de aquecimento) recomeçaria do zero e perderia entradas
+        # em silêncio. Não persiste sinal, não cria ordem, não incrementa
+        # contador operacional e não chama o motor de risco.
+        orchestrator.hydrate_strategy_state(session)
 
         orchestrator.reconcile(session, state)
 

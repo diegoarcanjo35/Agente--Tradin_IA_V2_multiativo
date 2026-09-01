@@ -278,7 +278,14 @@ def test_orchestrator_blocks_trading_on_gap_detected_but_keeps_polling(session_f
         http_get=store.http_get, sleep=lambda s: None, now_fn=lambda: fixed_now,
         page_size=10, max_pages_per_poll=10, initial_start=BASE,
     )
-    settings = Settings(mode=RunMode.BYBIT_DEMO, bybit_api_key="k", bybit_api_secret="s")
+    settings = Settings(
+        mode=RunMode.BYBIT_DEMO, bybit_api_key="k", bybit_api_secret="s",
+        # Fase 3.2: este teste exercita o pipeline OPERACIONAL "um candle
+        # -> uma decisão". O default do timeframe estratégico passou a ser
+        # 5 minutos; 1 minuto é a compatibilidade explícita mantida pelo PO
+        # e preserva exatamente a intenção original do teste.
+        strategy_timeframe_minutes=1,
+    )
     price_state: dict[str, float] = {}
     orch = Orchestrator(
         settings=settings, session_factory=session_factory,
@@ -323,7 +330,14 @@ def test_provider_restart_mid_drain_resumes_via_persisted_cursor_without_duplica
     rows = _rows(9, BASE)
     store = FakeKlineStore(rows)
     fixed_now = BASE + timedelta(minutes=9, seconds=30)
-    settings = Settings(mode=RunMode.BYBIT_DEMO, bybit_api_key="k", bybit_api_secret="s")
+    settings = Settings(
+        mode=RunMode.BYBIT_DEMO, bybit_api_key="k", bybit_api_secret="s",
+        # Fase 3.2: este teste exercita o pipeline OPERACIONAL "um candle
+        # -> uma decisão". O default do timeframe estratégico passou a ser
+        # 5 minutos; 1 minuto é a compatibilidade explícita mantida pelo PO
+        # e preserva exatamente a intenção original do teste.
+        strategy_timeframe_minutes=1,
+    )
 
     def build_orch(provider):
         price_state: dict[str, float] = {}

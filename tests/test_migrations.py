@@ -255,7 +255,14 @@ def test_orchestrator_tick_runs_successfully_after_upgrade(tmp_path):
     run_migrations(engine)
     session_factory = make_session_factory(engine)
 
-    settings = Settings(mode=RunMode.REPLAY)
+    settings = Settings(
+        mode=RunMode.REPLAY,
+        # Fase 3.2: este teste exercita o pipeline OPERACIONAL "um candle
+        # -> uma decisão". O default do timeframe estratégico passou a ser
+        # 5 minutos; 1 minuto é a compatibilidade explícita mantida pelo PO
+        # e preserva exatamente a intenção original do teste.
+        strategy_timeframe_minutes=1,
+    )
     price_state: dict[str, float] = {}
     orch = Orchestrator(
         settings=settings, session_factory=session_factory,

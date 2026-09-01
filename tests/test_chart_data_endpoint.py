@@ -18,7 +18,13 @@ from tests.factories import activate_operational_state
 
 
 def _make_client(tmp_path, name, symbols):
-    settings = Settings(mode=RunMode.REPLAY, symbols=symbols, database_url=f"sqlite:///{tmp_path / name}")
+    settings = Settings(
+        mode=RunMode.REPLAY, symbols=symbols, database_url=f"sqlite:///{tmp_path / name}",
+        # Fase 3.2: estes testes verificam a série OPERACIONAL de 1
+        # minuto candle a candle -- timeframe estratégico 1 preserva a
+        # intenção original (um candle processado por tick).
+        strategy_timeframe_minutes=1,
+    )
     orch = build_orchestrator(settings)
     activate_operational_state(orch)
 

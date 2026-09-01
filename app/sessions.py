@@ -14,7 +14,15 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.core.clock import utcnow
-from app.core.errors import StartingBalanceResetBlockedError
+from app.core.errors import (
+    StartingBalanceResetBlockedError,
+    StrategyTimeframeChangeBlockedError,
+)
+from app.core.timeframe import (
+    CANONICAL_OPERATIONAL_TIMEFRAME,
+    OPERATIONAL_TIMEFRAME_MINUTES,
+    minutes_to_canonical,
+)
 from app.persistence.models import OperationalSession, Position
 from app.risk.config import RiskLimits
 from app.strategy.engine import StrategyConfig
@@ -111,11 +119,81 @@ def resolve_accounting_base(
     return base.started_at, base
 
 
-# The single supported candle timeframe -- not a configurable Settings
-# field (there is only ever one), so this is a plain module constant rather
-# than a per-request value. Kept as its own name (not re-inlined at each use
-# site) purely for readability.
-TIMEFRAME = "1"
+# Fase 3.2: o timeframe OPERACIONAL de coleta continua sendo um só (1
+# minuto, a fonte primária de mercado) -- mas agora vem da representação
+# CANÔNICA única ("1m", decisão Q4 do PO), nunca mais do alias "1" que a
+# API da Bybit usa. O timeframe ESTRATÉGICO, esse sim configurável
+# (1/5/15), é lido de `settings.strategy_timeframe_minutes` e entra
+# separadamente no fingerprint -- ver `_config_fingerprint`.
+TIMEFRAME = CANONICAL_OPERATIONAL_TIMEFRAME
+
+
+def strategy_timeframe(settings) -> str:
+    """A grafia canônica do timeframe estratégico configurado (ex. "5m")."""
+    return minutes_to_canonical(settings.strategy_timeframe_minutes)
+
+
+def _session_strategy_timeframe(op_session: OperationalSession | None) -> str | None:
+    """O timeframe estratégico CONGELADO no snapshot da sessão. `None`
+    para uma sessão legada (criada antes deste campo existir) -- nesse
+    caso a guarda abaixo não dispara, porque não há valor anterior contra
+    o qual comparar honestamente."""
+    if op_session is None:
+        return None
+    try:
+        snapshot = json.loads(op_session.config_snapshot_json)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(snapshot, dict):
+        return None
+    minutes = snapshot.get("strategy_timeframe_minutes")
+    if not isinstance(minutes, int):
+        return None
+    try:
+        return minutes_to_canonical(minutes)
+    except ValueError:
+        return None
+
+
+def _guard_strategy_timeframe_change(
+    session: Session, existing: OperationalSession, settings,
+) -> None:
+    """Fase 3.2 (item 10 da decisão do PO): mudar
+    `STRATEGY_TIMEFRAME_MINUTES` com QUALQUER posição aberta na carteira
+    interrompe a inicialização.
+
+    Motivo: uma posição aberta sob uma cadência temporal não pode passar
+    silenciosamente a ser administrada por outra -- stop e alvo foram
+    dimensionados a partir do ATR daquele timeframe, e `_check_stop_take`
+    seguiria avaliando-a sob premissas que deixaram de valer.
+
+    Verifica TODOS os símbolos (consulta global, sem filtro de símbolo) e
+    roda ANTES de qualquer escrita: levanta antes de `end_session`, então
+    nenhuma sessão anterior é encerrada, nenhuma nova é criada e nenhum
+    estado parcial é persistido. Mudar o timeframe SEM posição aberta
+    continua permitido (cria sessão operacional nova, preservando a mesma
+    base contábil), e reiniciar sem mudança nenhuma continua permitido.
+
+    Deliberadamente restrita ao timeframe: qualquer OUTRA mudança de
+    estratégia (períodos, filtros, múltiplos) segue sem guarda, como
+    antes -- o PO pediu explicitamente para não ampliar esta proteção."""
+    old_timeframe = _session_strategy_timeframe(existing)
+    new_timeframe = strategy_timeframe(settings)
+    if old_timeframe is None or old_timeframe == new_timeframe:
+        return
+    open_positions = session.execute(
+        select(Position).where(Position.status == "OPEN")
+    ).scalars().all()
+    if open_positions:
+        symbols_desc = ", ".join(sorted({p.symbol for p in open_positions}))
+        raise StrategyTimeframeChangeBlockedError(
+            f"STRATEGY_TIMEFRAME_MINUTES mudou de {old_timeframe} para {new_timeframe}, mas "
+            f"existem posições ABERTAS ({symbols_desc}) que passariam a ser administradas por "
+            "uma estratégia temporal diferente daquela que as abriu (stop e alvo foram "
+            "dimensionados pelo ATR do timeframe anterior). Feche todas as posições abertas "
+            "antes de alterar o timeframe estratégico, ou reverta STRATEGY_TIMEFRAME_MINUTES "
+            "para o valor anterior. Nenhuma alteração foi feita."
+        )
 
 
 def _canonical_symbols_json(symbols: list[str]) -> str:
@@ -171,6 +249,27 @@ def _sanitized_config_snapshot(settings) -> dict:
         # app/api/routes_dashboard.py::_session_starting_balance para o
         # fallback explícito de US$ 1.000,00 nesse caso.
         "paper_starting_balance_usd": settings.paper_starting_balance_usd,
+        # Fase 3.2: configuração de estratégia e do gate de viabilidade
+        # líquida -- todos alteram DECISÃO diretamente, então entram no
+        # snapshot (congelados por sessão) e, por consequência, no
+        # fingerprint. `market_data_timeframe_minutes` é gravado
+        # explicitamente mesmo sendo fixo nesta fase, para que uma sessão
+        # antiga continue provando em que cadência de COLETA ela rodou.
+        "market_data_timeframe_minutes": OPERATIONAL_TIMEFRAME_MINUTES,
+        "strategy_timeframe_minutes": settings.strategy_timeframe_minutes,
+        "strategy_fast_period": settings.strategy_fast_period,
+        "strategy_slow_period": settings.strategy_slow_period,
+        "strategy_atr_period": settings.strategy_atr_period,
+        "strategy_min_atr_pct": settings.strategy_min_atr_pct,
+        "strategy_max_atr_pct": settings.strategy_max_atr_pct,
+        "strategy_stop_loss_atr_multiple": settings.strategy_stop_loss_atr_multiple,
+        "strategy_take_profit_atr_multiple": settings.strategy_take_profit_atr_multiple,
+        "strategy_expected_move_atr_multiple": settings.strategy_expected_move_atr_multiple,
+        "minimum_cost_coverage_ratio": settings.minimum_cost_coverage_ratio,
+        # Estimativas de custo de BYBIT_DEMO: nomes próprios, nunca
+        # confundidas com as do simulador PAPER (decisão Q3 do PO).
+        "bybit_taker_fee_rate": settings.bybit_taker_fee_rate,
+        "bybit_expected_slippage_bps": settings.bybit_expected_slippage_bps,
     }
     if settings.mode.value != "REPLAY":
         # The base URL is not a secret (it's the allowlisted demo host,
@@ -211,7 +310,14 @@ def _config_fingerprint(
     payload = {
         "mode": settings.mode.value,
         "symbols": list(settings.symbols),
+        # Fase 3.2: os DOIS timeframes entram, separados e nomeados -- o
+        # operacional (coleta, fixo em 1m nesta fase) e o estratégico
+        # (1/5/15, configurável). Antes havia só um campo "timeframe", o
+        # que tornaria impossível distinguir uma mudança de cadência de
+        # DECISÃO de uma mudança de cadência de COLETA.
         "timeframe": TIMEFRAME,
+        "market_data_timeframe": TIMEFRAME,
+        "strategy_timeframe": strategy_timeframe(settings),
         "strategy_version": strategy_version,
         "strategy_config": asdict(strategy_config),
         "risk_config": asdict(risk_limits),
@@ -307,7 +413,11 @@ def start_or_resume_session(
     if existing is not None:
         if existing.config_fingerprint == fingerprint:
             return existing
+        # Ambas as guardas rodam ANTES de qualquer escrita: se alguma
+        # levantar, a sessão anterior permanece aberta e nenhuma nova é
+        # criada -- nenhum estado parcial persistido.
         _guard_starting_balance_reset(session, existing, settings)
+        _guard_strategy_timeframe_change(session, existing, settings)
         end_session(
             session, existing,
             "Configuração operacional alterada; sessão substituída.",
@@ -319,7 +429,12 @@ def start_or_resume_session(
         mode=settings.mode.value,
         symbol=settings.symbols[0] if is_mono_symbol else None,
         symbols=canonical_symbols,
-        timeframe=TIMEFRAME,
+        # Fase 3.2: a coluna `timeframe` da sessão passa a registrar o
+        # timeframe ESTRATÉGICO canônico (é ele que caracteriza a cadência
+        # de DECISÃO desta sessão). O operacional continua fixo em 1m e
+        # está no snapshot como `market_data_timeframe_minutes`. Linhas
+        # legadas mantêm o que sempre tiveram -- nada é reescrito.
+        timeframe=strategy_timeframe(settings),
         strategy_version=strategy_version,
         risk_config_json=json.dumps(asdict(risk_limits)),
         config_snapshot_json=json.dumps(_sanitized_config_snapshot(settings)),

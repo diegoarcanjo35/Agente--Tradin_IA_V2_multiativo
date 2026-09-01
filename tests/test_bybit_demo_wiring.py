@@ -30,6 +30,18 @@ def make_bybit_demo_settings(**overrides) -> Settings:
         bybit_ws_url="wss://stream-demo.bybit.com",
         database_url="sqlite:///:memory:",
         symbol="BTCUSDT",
+        # Fase 3.2: estes testes exercitam o pipeline OPERACIONAL "um
+        # candle -> uma decisão". O default passou a ser 5 minutos, então
+        # o timeframe estratégico de 1 minuto (compatibilidade explícita
+        # mantida pelo PO) preserva exatamente a intenção original.
+        strategy_timeframe_minutes=1,
+        # Fase 3.2: estas suítes verificam o CICLO DE VIDA da ordem
+        # (submit/poll/fill/reconciliação), não a viabilidade de custo.
+        # Com estimativa de custo zero o gate aprova qualquer movimento
+        # esperado positivo -- é o cenário "custo zero configurado" que o
+        # próprio PO listou como caso obrigatório, e mantém a intenção
+        # original destes testes intacta. O gate em si é coberto, com
+        # números reais, em tests/test_cost_gate.py.
     )
     defaults.update(overrides)
     return Settings(**defaults)

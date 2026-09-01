@@ -203,6 +203,16 @@ fechado, TradingView Lightweight Charts vendorizado localmente (ver
 `THIRD_PARTY_NOTICES.md`), e isolamento multiativo do gráfico (troca de
 símbolo nunca mistura estado).
 
+## Estratégia multitemporal (Fase 3.2)
+
+Ver `docs/ESTRATEGIA_MULTITEMPORAL.md` para o desenho completo: separação
+entre a cadência de COLETA (1 minuto, fixa) e a de DECISÃO (1/5/15
+minutos, configurável), a canonicalização do timeframe (`"1m"` canônico,
+`"1"` apenas como alias legado de leitura), o agregador determinístico com
+fechamento imediato e bucket incompleto explícito, a hidratação silenciosa
+do estado estratégico no reinício, o gate de viabilidade líquida antes da
+abertura e a reancoragem de stop/alvo no preço médio real do fill.
+
 ## Painel financeiro (Fase 3.1.1)
 
 Ver `docs/PAINEL_FINANCEIRO.md` para o desenho completo: fórmula oficial
