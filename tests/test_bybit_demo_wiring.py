@@ -80,8 +80,27 @@ def _generate_kline_rows(n_down: int, n_up: int) -> list[list[str]]:
     DEFAULT StrategyEngine config (fast=9/slow=21/atr=14) to actually
     produce a bullish crossover -- real past timestamps (minutes before
     "now") so BybitDemoMarketDataProvider's closed-candle check passes with
-    its default now_fn=utcnow, no clock injection needed."""
-    start = datetime.now(timezone.utc) - timedelta(minutes=n_down + n_up + 5)
+    its default now_fn=utcnow, no clock injection needed.
+
+    Fase 3.3.1 -- ANCORAGEM NO PRESENTE: a série termina no último minuto
+    JÁ FECHADO (o minuto corrente é servido à parte pelo
+    `_KlineSequenceTransport` como candle em formação). Antes ela terminava
+    cinco minutos atrás e começava ~50 min atrás, o que fazia dela uma
+    série genuinamente velha -- e a barreira de frescor recusava, com
+    razão, o sinal que estes testes precisam aprovar.
+
+    Consequência que dita o tamanho da rampa: o cruzamento acontece no
+    índice 32 da sequência (fast=9/slow=21 sobre 25 candles de queda),
+    então CADA candle de rampa depois dele empurra o cruzamento um minuto
+    mais para o passado. Com `n_up=10` o sinal nasce entre 2 e 3 minutos
+    atrás -- dentro da janela real de 300 s, sem afrouxar nada. Uma rampa
+    de 20 candles colocaria o cruzamento a ~12 min do presente, e nenhuma
+    ancoragem consertaria isso: numa série de 1 minuto, ter N candles
+    depois do cruzamento significa, literalmente, N minutos de idade."""
+    start = (
+        datetime.now(timezone.utc).replace(second=0, microsecond=0)
+        - timedelta(minutes=n_down + n_up)
+    )
     rows: list[list[str]] = []
     price = 100.0
     for i in range(n_down):
@@ -173,7 +192,7 @@ def test_bybit_demo_pipeline_reaches_execution_engine_with_zero_network():
         risk_max_position_usd=50.0, risk_max_total_exposure_usd=50.0,
     )
     base_transport = FakeBybitTransport()
-    rows = _generate_kline_rows(n_down=25, n_up=20)
+    rows = _generate_kline_rows(n_down=25, n_up=10)
     transport = _KlineSequenceTransport(base_transport, rows)
 
     orch = build_orchestrator(settings, bybit_transport=transport)

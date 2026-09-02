@@ -51,10 +51,22 @@ def test_activate_endpoint_moves_observando_to_ativo_and_allows_entry(tmp_path):
         database_url=f"sqlite:///{tmp_path / 'activate_entry.db'}",
     )
     base_transport = FakeBybitTransport()
-    rows = _generate_kline_rows(n_down=25, n_up=20)
+    rows = _generate_kline_rows(n_down=25, n_up=10)
     transport = _KlineSequenceTransport(base_transport, rows)
     orch = build_orchestrator(settings, bybit_transport=transport)
     client = make_client(orch)
+
+    # Fase 3.3.1: a ativação passou a exigir carteira pronta -- aquecimento
+    # concluído e série no presente. Drenar a perna de baixa antes de ativar
+    # é o que um operador realmente faria (e o que a V2 fez em produção):
+    # deixar o motor aquecer e só então autorizar entradas. O cruzamento de
+    # alta continua na perna seguinte, ainda por processar.
+    # 32 candles: aquece o motor E deixa a série no presente (o último
+    # candle drenado fecha ~3 min atrás, dentro da janela real de 300 s).
+    # O cruzamento de alta está no candle 33 -- ainda por processar,
+    # exatamente como antes.
+    for _ in range(32):
+        orch.tick()
 
     resp = client.post("/api/operational-state/activate")
     assert resp.status_code == 200
@@ -171,7 +183,7 @@ def test_session_created_at_startup_and_resumed_after_restart(tmp_path):
 def test_session_counters_increment_as_a_real_tick_progresses():
     settings = make_bybit_demo_settings(risk_max_position_usd=50.0, risk_max_total_exposure_usd=50.0)
     base_transport = FakeBybitTransport()
-    rows = _generate_kline_rows(n_down=25, n_up=20)
+    rows = _generate_kline_rows(n_down=25, n_up=10)
     transport = _KlineSequenceTransport(base_transport, rows)
     orch = build_orchestrator(settings, bybit_transport=transport)
     activate_operational_state(orch)

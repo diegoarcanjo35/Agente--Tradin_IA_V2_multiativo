@@ -187,6 +187,30 @@ def disengage_kill_switch(request: Request):
 _ACTIVATABLE_FROM = frozenset({"OBSERVANDO", "PAUSADO"})
 
 
+
+def _symbol_health_snapshot(orch) -> dict:
+    """Saúde por símbolo + aquecimento, para o gate de ativação. Funciona
+    tanto com `MultiSymbolOrchestrator` (que tem `health`) quanto com um
+    `Orchestrator` monoativo (que não tem) -- no monoativo a saúde por
+    símbolo simplesmente não existe e só o aquecimento é consultado."""
+    saude = {}
+    health = getattr(orch, "health", None)
+    subs = getattr(orch, "orchestrators", None) or {orch.settings.symbol: orch}
+    for symbol, sub in subs.items():
+        entry = {}
+        if health is not None and symbol in health:
+            h = health[symbol]
+            entry.update({
+                "status": h.status,
+                "has_gap": h.has_gap,
+                "consecutive_failures": h.consecutive_failures,
+                "last_error": h.last_error,
+            })
+        entry["warmup"] = sub.strategy_engine.warmup_state()
+        saude[symbol] = entry
+    return saude
+
+
 @router.post("/operational-state/activate")
 def activate_operational_state(request: Request):
     """Fase 2, item 7.8: the ONLY way new entries ever become authorized --
@@ -235,6 +259,71 @@ def activate_operational_state(request: Request):
                     "foi concluída."
                 ),
             }
+        # Fase 3.3.1: GATE TEMPORAL DE ATIVAÇÃO. Antes desta fase, a
+        # ativação só olhava heartbeat do motor, bloqueio de operações e
+        # reconciliação inicial -- tudo isso reportava SAUDÁVEL enquanto a
+        # carteira decidia sobre candles de horas atrás. Agora cada
+        # símbolo precisa estar TEMPORALMENTE pronto, e o gate é ATÔMICO:
+        # um único símbolo fora do limite impede a carteira inteira de
+        # ficar ATIVA -- nunca metade ativa.
+        from app.api.routes_dashboard import (
+            portfolio_temporal_readiness,
+            symbol_temporal_currency,
+        )
+
+        readiness = portfolio_temporal_readiness(orch, session)
+        health = _symbol_health_snapshot(orch)
+        impedimentos = []
+        # Em modos com série replayada a checagem TEMPORAL não se aplica
+        # (ver portfolio_temporal_readiness); as demais -- saúde, gap,
+        # falhas e aquecimento -- continuam valendo em todos os modos.
+        checar_tempo = readiness.get("applicable", True)
+        for symbol in list(orch.settings.symbols):
+            atual = readiness["per_symbol"].get(symbol, {})
+            h = health.get(symbol, {})
+            motivos = []
+            if h.get("status") and h["status"] != "SAUDAVEL":
+                motivos.append(f"saúde {h['status']}")
+            if h.get("has_gap"):
+                motivos.append("lacuna de mercado (has_gap)")
+            if h.get("consecutive_failures"):
+                motivos.append(f"{h['consecutive_failures']} falha(s) consecutiva(s)")
+            if h.get("last_error"):
+                motivos.append(f"último erro: {h['last_error']}")
+            warm = h.get("warmup") or {}
+            if warm and not warm.get("ready", True):
+                motivos.append(
+                    f"aquecimento incompleto ({warm.get('have')}/{warm.get('required')})"
+                )
+            if checar_tempo and not atual.get("current"):
+                falha = atual.get("failure", "dado indisponível")
+                atraso = atual.get("delay_seconds")
+                motivos.append(
+                    f"dado de mercado não está no presente ({falha}"
+                    + (f", atraso {atraso:.0f}s" if isinstance(atraso, (int, float)) else "")
+                    + f", limite {atual.get('max_delay_seconds')}s"
+                    + (f", último candle {atual.get('last_candle_open_time')}"
+                       if atual.get("last_candle_open_time") else "")
+                    + ")"
+                )
+            if motivos:
+                impedimentos.append({"symbol": symbol, "motivos": motivos, "temporal": atual})
+
+        if impedimentos:
+            descricao = "; ".join(
+                f"{i['symbol']}: " + ", ".join(i["motivos"]) for i in impedimentos
+            )
+            return {
+                "operational_state": state.operational_state,
+                "mensagem": (
+                    "Não é possível ativar novas entradas: pelo menos um símbolo não está "
+                    f"temporalmente pronto. {descricao}. A ativação é atômica -- nenhuma parte "
+                    "da carteira fica ATIVA enquanto houver bloqueador."
+                ),
+                "blocking_symbols": [i["symbol"] for i in impedimentos],
+                "temporal_readiness": readiness,
+            }
+
         if state.operational_state not in _ACTIVATABLE_FROM:
             return {
                 "operational_state": state.operational_state,

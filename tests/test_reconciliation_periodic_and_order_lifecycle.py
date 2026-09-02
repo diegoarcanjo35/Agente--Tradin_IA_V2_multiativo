@@ -32,7 +32,7 @@ from tests.test_bybit_demo_wiring import (
 def test_order_filled_via_orchestrator_transitions_state_machine_and_persists_totals():
     settings = make_bybit_demo_settings(risk_max_position_usd=50.0, risk_max_total_exposure_usd=50.0)
     base_transport = FakeBybitTransport()
-    rows = _generate_kline_rows(n_down=25, n_up=20)
+    rows = _generate_kline_rows(n_down=25, n_up=10)
     transport = _KlineSequenceTransport(base_transport, rows)
     orch = build_orchestrator(settings, bybit_transport=transport)
     activate_operational_state(orch)
@@ -68,7 +68,7 @@ def test_order_ending_unknown_blocks_further_new_entries():
     UNKNOWN pode liberar nova exposição")."""
     settings = make_bybit_demo_settings(risk_max_position_usd=50.0, risk_max_total_exposure_usd=50.0)
     base_transport = FakeBybitTransport()
-    rows = _generate_kline_rows(n_down=25, n_up=20)
+    rows = _generate_kline_rows(n_down=25, n_up=10)
 
     class _NeverConfirmsTransport(_KlineSequenceTransport):
         def http_post(self, url, payload):

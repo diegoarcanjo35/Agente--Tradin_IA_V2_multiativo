@@ -24,6 +24,7 @@ from app.persistence.db import init_db, make_engine, make_session_factory, sessi
 from app.persistence import repo
 from app.persistence.models import OperationalSession
 from app.core.errors import ReplayFixtureMissingError
+from app.core.freshness import freshness_policy_for_market_data
 from app.core.timeframe import CANONICAL_OPERATIONAL_TIMEFRAME, bybit_interval
 from app.risk.cost_model import (
     SOURCE_BYBIT_DEMO_ESTIMATE,
@@ -287,7 +288,20 @@ def build_orchestrator(settings, bybit_transport=None) -> Orchestrator | MultiSy
     # que o motor de execução realmente aplica (quando ele os expõe), ou a
     # estimativa declarada de BYBIT_DEMO -- nunca uma terceira cópia que
     # pudesse divergir das duas.
-    risk_engine = RiskEngine(limits=risk_limits, cost_model=None)
+    # Fase 3.3.1: a política de frescor vem da MESMA configuração que
+    # dirige o agregador (`strategy_timeframe_minutes`), nunca de uma
+    # segunda cópia que pudesse divergir dele.
+    # Decidida pela SEMÂNTICA TEMPORAL DA FONTE DE MERCADO, nunca pelo
+    # motor de execução: PAPER_LIVE roda PaperLocalExecutionEngine e
+    # continua integralmente protegido.
+    freshness_policy = freshness_policy_for_market_data(
+        settings.mode.value,
+        settings.max_signal_delay_after_close_seconds,
+        settings.strategy_timeframe_minutes,
+    )
+    risk_engine = RiskEngine(
+        limits=risk_limits, cost_model=None, freshness_policy=freshness_policy,
+    )
 
     # Single source of truth for "the price of the candle currently driving
     # the decision", already keyed by symbol -- the orchestrator writes it

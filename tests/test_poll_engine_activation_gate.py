@@ -18,6 +18,7 @@ from app.persistence.db import session_scope
 from tests.fakes.bybit_fake import FakeBybitTransport
 from tests.test_bybit_demo_wiring import make_bybit_demo_settings
 from app.api.main import build_orchestrator
+from tests.factories import make_portfolio_temporally_ready
 
 
 def _make_client(orch, poll_health: PollHealth | None):
@@ -81,6 +82,11 @@ def test_activation_refused_when_heartbeat_expired_even_if_status_says_saudavel(
 def test_activation_allowed_when_engine_saudavel(tmp_path):
     settings = make_bybit_demo_settings(database_url=f"sqlite:///{tmp_path / 'gate_saudavel.db'}")
     orch = build_orchestrator(settings, bybit_transport=FakeBybitTransport())
+    # Fase 3.3.1: o gate de ativação passou a exigir carteira
+    # temporalmente pronta (série no presente, aquecimento concluído,
+    # sem gap, sem falha). Um orquestrador que nunca ticou não atende --
+    # corretamente. O helper representa um sistema que já estava rodando.
+    make_portfolio_temporally_ready(orch)
     health = PollHealth(status=PollEngineStatus.SAUDAVEL, poll_last_success_at=utcnow())
     client = _make_client(orch, health)
 
@@ -95,6 +101,11 @@ def test_activation_allowed_when_no_poll_health_wired_at_all(tmp_path):
     funcionando exatamente como antes -- o gate é pulado, não um erro."""
     settings = make_bybit_demo_settings(database_url=f"sqlite:///{tmp_path / 'gate_no_health.db'}")
     orch = build_orchestrator(settings, bybit_transport=FakeBybitTransport())
+    # Fase 3.3.1: o gate de ativação passou a exigir carteira
+    # temporalmente pronta (série no presente, aquecimento concluído,
+    # sem gap, sem falha). Um orquestrador que nunca ticou não atende --
+    # corretamente. O helper representa um sistema que já estava rodando.
+    make_portfolio_temporally_ready(orch)
     client = _make_client(orch, poll_health=None)
 
     resp = client.post("/api/operational-state/activate")

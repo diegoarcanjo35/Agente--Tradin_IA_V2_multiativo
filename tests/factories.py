@@ -34,6 +34,52 @@ def activate_operational_state(orchestrator) -> None:
             if op_session is not None:
                 op_session.status = "ATIVO"
 
+
+def make_portfolio_temporally_ready(orchestrator, minutes_ago: int = 1, candles: int = 130) -> None:
+    """Fase 3.3.1: coloca a carteira no estado de um sistema QUE JÁ ESTAVA
+    RODANDO, para testes que exercitam a ATIVAÇÃO via HTTP.
+
+    O gate de ativação passou a exigir, além de heartbeat do motor, que
+    cada símbolo esteja temporalmente pronto: série no presente, aquecimento
+    concluído, sem gap, sem falha. Um orquestrador recém-construído que
+    nunca ticou não atende nada disso -- e não deve mesmo atender.
+
+    Faz três coisas, todas pelos caminhos REAIS do sistema:
+    1. persiste candles de 1 minuto terminando `minutes_ago` do agora;
+    2. reexecuta a hidratação silenciosa (aquecimento a partir do banco);
+    3. registra um tick saudável por símbolo via `_update_health`, nunca
+       atribuindo `status` na mão.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    from app.core.clock import utcnow
+
+    subs = getattr(orchestrator, "orchestrators", None) or {
+        orchestrator.settings.symbol: orchestrator
+    }
+    agora = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+    fim = agora - timedelta(minutes=minutes_ago)
+    with session_scope(orchestrator.session_factory) as session:
+        for symbol in subs:
+            for i in range(candles):
+                t = fim - timedelta(minutes=candles - 1 - i)
+                preco = 100.0 + (i % 7) * 0.5
+                repo.save_candle(
+                    session, symbol, "1m", t, preco, preco + 1, preco - 1, preco, 10.0, "teste",
+                )
+
+    for sub in subs.values():
+        sub._strategy_state_hydrated = False
+    with session_scope(orchestrator.session_factory) as session:
+        orchestrator.hydrate_strategy_state(session)
+
+    health = getattr(orchestrator, "health", None)
+    if health is not None:
+        for symbol in health:
+            orchestrator._update_health(
+                symbol, utcnow(), {"status": "hold", "strategy_bucket_complete": True},
+            )
+
 NOW = datetime(2024, 1, 1, 12, 0, tzinfo=timezone.utc)
 
 

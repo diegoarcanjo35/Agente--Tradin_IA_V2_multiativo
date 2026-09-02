@@ -664,6 +664,111 @@ def recent_ai_recommendations(
     return list(session.execute(stmt).scalars().all())
 
 
+def signal_counts(session: Session, symbol: str | None = None, since: datetime | None = None) -> dict:
+    """Fase 3.3.1: contagem CANÔNICA de sinais, direto do banco.
+
+    Existe porque a auditoria da Fase 3.3 usou `/api/signals?limit=200` e
+    leu o retorno saturado no limite como se fosse o total (eram 257).
+    Métrica de auditoria nunca pode sair de endpoint paginado -- esta
+    função conta com `COUNT(*)`, sem limite, sem paginação."""
+    stmt = select(StrategySignal.direction)
+    if symbol is not None:
+        stmt = stmt.where(StrategySignal.symbol == symbol)
+    if since is not None:
+        stmt = stmt.where(StrategySignal.created_at >= since)
+    direcoes = session.execute(stmt).scalars().all()
+
+    por_direcao: dict[str, int] = {}
+    for d in direcoes:
+        por_direcao[d] = por_direcao.get(d, 0) + 1
+    hold = por_direcao.get("HOLD", 0)
+    total = len(direcoes)
+    return {
+        "signals_total": total,
+        "actionable_signals_total": total - hold,
+        "hold_signals_total": hold,
+        "by_direction": por_direcao,
+    }
+
+
+def cost_gate_samples(
+    session: Session, symbol: str | None = None, since: datetime | None = None,
+) -> list[dict]:
+    """Fase 3.3.1: as avaliações do gate de custos que REALMENTE rodaram,
+    com a cobertura alcançada em cada uma -- matéria-prima da distribuição
+    exposta em `/api/metrics`.
+
+    Só entram avaliações com `cost_gate.applied is True`. Uma avaliação em
+    que o gate não rodou (recusada antes, por estado operacional ou por
+    frescor) NUNCA é contada como aprovada nem como rejeitada pelo gate --
+    ela simplesmente não é uma amostra dele."""
+    stmt = select(RiskEvaluation.checks_json).join(
+        StrategySignal, RiskEvaluation.signal_id == StrategySignal.id
+    )
+    if symbol is not None:
+        stmt = stmt.where(StrategySignal.symbol == symbol)
+    if since is not None:
+        stmt = stmt.where(RiskEvaluation.created_at >= since)
+
+    amostras: list[dict] = []
+    for raw in session.execute(stmt).scalars().all():
+        try:
+            checks = json.loads(raw)
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(checks, dict):
+            continue
+        gate = checks.get("cost_gate")
+        if not isinstance(gate, dict) or gate.get("applied") is not True:
+            continue
+        amostras.append(gate)
+    return amostras
+
+
+def rejection_reasons(
+    session: Session, symbol: str | None = None, since: datetime | None = None,
+) -> dict:
+    """Fase 3.3.1: em QUAL check cada avaliação de risco parou, agregado.
+
+    Responde de uma vez a pergunta que, na auditoria da Fase 3.3, exigiu
+    consulta manual ao sqlite: "onde as decisões estão morrendo?".
+    Compatível com `checks_json` antigos -- a chave legada `data_fresh`
+    é reconhecida junto com a atual `data_reception_recent`."""
+    stmt = select(RiskEvaluation.approved, RiskEvaluation.checks_json).join(
+        StrategySignal, RiskEvaluation.signal_id == StrategySignal.id
+    )
+    if symbol is not None:
+        stmt = stmt.where(StrategySignal.symbol == symbol)
+    if since is not None:
+        stmt = stmt.where(RiskEvaluation.created_at >= since)
+
+    por_motivo: dict[str, int] = {}
+    total = 0
+    aprovadas = 0
+    for approved, raw in session.execute(stmt).all():
+        total += 1
+        if approved:
+            aprovadas += 1
+            continue
+        try:
+            checks = json.loads(raw)
+        except (TypeError, ValueError):
+            por_motivo["(checks ilegivel)"] = por_motivo.get("(checks ilegivel)", 0) + 1
+            continue
+        falhou = [k for k, v in checks.items() if v is False]
+        motivo = falhou[0] if falhou else "(motivo nao registrado)"
+        por_motivo[motivo] = por_motivo.get(motivo, 0) + 1
+
+    dominante = max(por_motivo.items(), key=lambda kv: kv[1])[0] if por_motivo else None
+    return {
+        "evaluations_total": total,
+        "approved_total": aprovadas,
+        "rejected_total": total - aprovadas,
+        "by_reason": por_motivo,
+        "dominant_reason": dominante,
+    }
+
+
 def cost_gate_stats(
     session: Session, symbol: str | None = None, since: datetime | None = None,
 ) -> dict:

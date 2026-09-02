@@ -298,6 +298,22 @@ class Settings(BaseSettings):
     strategy_expected_move_atr_multiple: float = Field(default=1.0)
     minimum_cost_coverage_ratio: float = Field(default=3.0)
 
+    # Fase 3.3.1: BARREIRA DE FRESCOR. Janela máxima, em SEGUNDOS, entre o
+    # FECHAMENTO do bucket estratégico que originou o sinal e o instante
+    # em que a entrada é avaliada. Medido a partir do fechamento (e não da
+    # abertura) porque um sinal de 5 minutos nasce, por construção, ~5
+    # minutos depois da abertura do bucket -- ver app/core/freshness.py.
+    #
+    # Existe porque, até esta fase, nada no caminho de decisão comparava
+    # `source_candle_open_time` com o relógio: durante a drenagem de um
+    # backlog, um cruzamento de 2 horas atrás chegava ao motor de risco
+    # com todos os checks verdes e podia virar ordem a preço histórico.
+    #
+    # Vale SOMENTE para abertura/aumento de exposição. Fechamento,
+    # redução, stop-loss, take-profit, liquidação de segurança,
+    # reconciliação e kill-switch nunca são bloqueados por frescor.
+    max_signal_delay_after_close_seconds: float = Field(default=300.0)
+
     # Correção v1.1 #5: optional, default-OFF external AI Shadow provider.
     # SimulatedProvider remains the production default in every case --
     # this only takes effect when explicitly enabled AND an API key is
@@ -520,6 +536,24 @@ class Settings(BaseSettings):
         if v < 0 or (v == 0 and not zero_allowed):
             limit = "maior ou igual a zero" if zero_allowed else "maior que zero"
             raise ValueError(f"{info.field_name.upper()} deve ser {limit}; recebido {v!r}.")
+        return v
+
+    @field_validator("max_signal_delay_after_close_seconds")
+    @classmethod
+    def _validate_max_signal_delay(cls, v: float) -> float:
+        # Zero seria impossível de satisfazer na prática (o próprio tick
+        # leva algum tempo depois do fechamento do bucket) e NaN/Infinity
+        # tornariam a comparação sempre verdadeira ou sempre falsa, sem
+        # explicação -- exatamente o tipo de "aprovação por omissão" que
+        # esta barreira existe para impedir.
+        if not math.isfinite(v):
+            raise ValueError(
+                f"MAX_SIGNAL_DELAY_AFTER_CLOSE_SECONDS deve ser finito; recebido {v!r}."
+            )
+        if v <= 0:
+            raise ValueError(
+                f"MAX_SIGNAL_DELAY_AFTER_CLOSE_SECONDS deve ser maior que zero; recebido {v!r}."
+            )
         return v
 
     @field_validator("strategy_timeframe_minutes")

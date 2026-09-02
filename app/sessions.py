@@ -266,6 +266,13 @@ def _sanitized_config_snapshot(settings) -> dict:
         "strategy_take_profit_atr_multiple": settings.strategy_take_profit_atr_multiple,
         "strategy_expected_move_atr_multiple": settings.strategy_expected_move_atr_multiple,
         "minimum_cost_coverage_ratio": settings.minimum_cost_coverage_ratio,
+        # Fase 3.3.1: a janela de frescor é POLÍTICA OPERACIONAL -- muda
+        # quais decisões podem virar ordem. Entra no snapshot e, por
+        # consequência, no fingerprint: alterá-la encerra a sessão
+        # anterior e cria uma nova (jamais uma base contábil nova).
+        # Unidade: SEGUNDOS, contados APÓS o fechamento do bucket.
+        # Nada de relógio atual ou estado transitório entra aqui.
+        "max_signal_delay_after_close_seconds": settings.max_signal_delay_after_close_seconds,
         # Estimativas de custo de BYBIT_DEMO: nomes próprios, nunca
         # confundidas com as do simulador PAPER (decisão Q3 do PO).
         "bybit_taker_fee_rate": settings.bybit_taker_fee_rate,

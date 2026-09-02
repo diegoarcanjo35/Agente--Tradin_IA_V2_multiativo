@@ -17,7 +17,17 @@ from app.metrics.engine import (
     compute_period_performance,
     compute_unrealized_pnl,
 )
-from app.core.timeframe import CANONICAL_OPERATIONAL_TIMEFRAME, canonical_timeframe
+from app.core.clock import utcnow
+from app.core.freshness import (
+    market_data_is_historical,
+    market_data_temporally_current,
+)
+from app.core.timeframe import (
+    CANONICAL_OPERATIONAL_TIMEFRAME,
+    OPERATIONAL_TIMEFRAME_MINUTES,
+    canonical_timeframe,
+)
+from app.metrics.coverage import coverage_distribution
 from app.market_data.base import CandleTick
 from app.persistence import repo
 from app.strategy.aggregator import CandleAggregator
@@ -96,6 +106,67 @@ def _poll_health_dict(request: Request) -> dict:
         poll_health = PollHealth()
     return poll_health.as_dict()
 
+
+
+
+def symbol_temporal_currency(orch, session, symbol: str) -> dict:
+    """Fase 3.3.1, conceito (2): o último candle FECHADO deste símbolo
+    está próximo do presente?
+
+    Diferente de `data_reception_recent`, que só prova que o provider
+    entregou ALGUMA linha há pouco. É esta a pergunta que o gate de
+    ativação precisa responder -- e a que faltava quando a V2 permitia
+    ativar com 185 minutos de defasagem reportando saúde plena.
+
+    LIMITE (decisão do PO, Fase 3.3.1): é exatamente
+    `MAX_SIGNAL_DELAY_AFTER_CLOSE_SECONDS`, sem somar de novo a duração do
+    bucket estratégico. A idade já é contada a partir do FECHAMENTO do
+    candle (`last_candle_close_time`), então somar o bucket seria contar
+    duas vezes o mesmo intervalo.
+
+    Coerência exigida: se um sinal não pode virar entrada acima dessa
+    janela, o endpoint de ativação não pode declarar pronta uma carteira
+    que já a ultrapassou. Ativação e barreira de entrada passam a falar a
+    mesma língua -- 300 s nos dois lados, com os padrões."""
+    last_open = repo.get_last_candle_open_time(
+        session, symbol, CANONICAL_OPERATIONAL_TIMEFRAME,
+    )
+    return market_data_temporally_current(
+        last_candle_open_time=last_open,
+        market_data_timeframe_minutes=OPERATIONAL_TIMEFRAME_MINUTES,
+        now=utcnow(),
+        max_delay_seconds=orch.settings.max_signal_delay_after_close_seconds,
+    )
+
+
+def portfolio_temporal_readiness(orch, session) -> dict:
+    """Prontidão TEMPORAL da carteira inteira, símbolo a símbolo.
+
+    Atômica por contrato: basta um símbolo fora do limite para a carteira
+    inteira não estar pronta -- nunca meia carteira ativa."""
+    por_simbolo = {}
+    bloqueadores = []
+    for symbol in _configured_symbols(orch):
+        atual = symbol_temporal_currency(orch, session, symbol)
+        por_simbolo[symbol] = atual
+        if not atual["current"]:
+            bloqueadores.append(symbol)
+
+    # Mesmo critério da barreira de frescor: a SEMÂNTICA TEMPORAL DA
+    # FONTE DE MERCADO (app/core/freshness.py), nunca o motor de
+    # execução. Fonte histórica (série gravada) não tem atualidade a
+    # medir; fonte ao vivo -- inclusive PAPER_LIVE, que executa
+    # localmente -- tem, e é verificada. Quando não se aplica, fica
+    # registrado em `applicable`, nunca escondido num `ready: true` sem
+    # explicação.
+    aplicavel = not market_data_is_historical(orch.settings.mode.value)
+    return {
+        "applicable": aplicavel,
+        "mode": orch.settings.mode.value,
+        "ready": (not bloqueadores) if aplicavel else True,
+        "blocking_symbols": bloqueadores if aplicavel else [],
+        "per_symbol": por_simbolo,
+    }
 
 
 def _market_processing_status(request, orch) -> str:
@@ -254,6 +325,10 @@ def get_state(request: Request):
             # representando processo rodando E autorização de entrada.
             "market_processing_status": _market_processing_status(request, orch),
             "new_entries_status": _new_entries_status(state),
+            # Fase 3.3.1, conceito (2): a série está no PRESENTE? Nada a
+            # ver com `data_reception_recent`, que só olha a conexão.
+            "temporal_readiness": portfolio_temporal_readiness(orch, session),
+            "max_signal_delay_after_close_seconds": orch.settings.max_signal_delay_after_close_seconds,
             # Fase 2, item 7.5/7.9: every independent block cause, so the
             # painel can show each one separately -- never collapsed into a
             # single opaque boolean beyond `trading_blocked` itself.
@@ -496,13 +571,29 @@ def get_metrics(request: Request):
         # dos totais globais em `_metrics_for_trades`, nunca da média
         # simples dos percentuais por símbolo.
         global_gate = repo.cost_gate_stats(session)
+        required = getattr(
+            getattr(_sub_orchestrator(orch, _configured_symbols(orch)[0]), "risk_engine", None),
+            "cost_model", None,
+        )
+        required_ratio = required.minimum_cost_coverage_ratio if required else None
         result["cost_gate"] = {
             "evaluated": global_gate["evaluated"],
             "blocked_entries": global_gate["blocked"],
             # `None` (nunca 0.0 inventado) quando não houve nenhuma
             # avaliação com cobertura calculável.
             "avg_coverage_ratio_at_entry": global_gate["avg_coverage_ratio"],
+            # Fase 3.3.1: a distribuição, não só a média. Uma média não
+            # distingue "quase passando" de "muito longe" -- e era
+            # exatamente essa distinção que faltava para calibrar.
+            "coverage_distribution": coverage_distribution(
+                repo.cost_gate_samples(session), required_ratio,
+            ),
         }
+        # Fase 3.3.1: contagens CANÔNICAS, direto do banco. Nunca de
+        # `/api/signals?limit=N` -- foi assim que a auditoria da Fase 3.3
+        # reportou 200 sinais quando eram 257.
+        result["signal_counts"] = repo.signal_counts(session)
+        result["rejection_reasons"] = repo.rejection_reasons(session)
         incomplete_total = 0
         for symbol in _configured_symbols(orch):
             state = _strategy_state_for_symbol(orch, symbol)
@@ -512,7 +603,15 @@ def get_metrics(request: Request):
                 "evaluated": symbol_gate["evaluated"],
                 "blocked_entries": symbol_gate["blocked"],
                 "avg_coverage_ratio_at_entry": symbol_gate["avg_coverage_ratio"],
+                "coverage_distribution": coverage_distribution(
+                    repo.cost_gate_samples(session, symbol), required_ratio,
+                ),
             }
+            per_symbol[symbol]["signal_counts"] = repo.signal_counts(session, symbol)
+            per_symbol[symbol]["rejection_reasons"] = repo.rejection_reasons(session, symbol)
+            per_symbol[symbol]["temporal_currency"] = symbol_temporal_currency(
+                orch, session, symbol,
+            )
             per_symbol[symbol]["strategy_timeframe"] = state["strategy_timeframe"]
             per_symbol[symbol]["strategy_timeframe_minutes"] = state["strategy_timeframe_minutes"]
             per_symbol[symbol]["bucket_integrity"] = state["bucket_integrity"]

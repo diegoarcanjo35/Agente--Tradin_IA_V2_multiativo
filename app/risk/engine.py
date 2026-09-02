@@ -28,6 +28,11 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime
 
+from app.core.freshness import (
+    HISTORICAL_DATA_REASON,
+    FreshnessPolicy,
+    evaluate_signal_freshness,
+)
 from app.risk.config import RiskLimits
 from app.risk.cost_model import CostModel, evaluate_cost_gate
 from app.strategy.schemas import Signal
@@ -98,7 +103,12 @@ class RiskEvaluationResult:
 
 
 class RiskEngine:
-    def __init__(self, limits: RiskLimits | None = None, cost_model: CostModel | None = None):
+    def __init__(
+        self,
+        limits: RiskLimits | None = None,
+        cost_model: CostModel | None = None,
+        freshness_policy: FreshnessPolicy | None = None,
+    ):
         """Fase 3.2: `cost_model` liga o gate de viabilidade líquida. É
         opcional e default `None` -- sem ele o gate simplesmente não é
         aplicado e isso fica REGISTRADO em `checks["cost_gate"]` como
@@ -108,6 +118,12 @@ class RiskEngine:
         motor de execução realmente usa."""
         self.limits = limits or RiskLimits()
         self.cost_model = cost_model
+        # Fase 3.3.1: barreira de frescor. Opcional e default `None` --
+        # sem ela o check simplesmente NÃO é aplicado, e isso fica
+        # registrado em `checks["signal_freshness"]` como
+        # `applied: false`, nunca como aprovação implícita. Produção
+        # sempre passa uma (app/api/main.py::build_orchestrator).
+        self.freshness_policy = freshness_policy
 
     # -- Shared gating checks used by both evaluate() and evaluate_close() ---
 
@@ -128,7 +144,14 @@ class RiskEngine:
         if context.state_ambiguous:
             return "Estado local ambíguo em relação à corretora; reconciliação necessária."
 
-        checks["data_fresh"] = not context.data_is_stale
+        # Fase 3.3.1: renomeado de `data_fresh`. Este check mede RECÊNCIA
+        # DE RECEPÇÃO (`utcnow() - provider._last_received_at`), ou seja,
+        # saúde da conexão -- NUNCA a idade do candle. Durante a drenagem
+        # de um backlog, candles de horas atrás são "recebidos agora" e
+        # este check passa, corretamente. Quem mede idade de dado é
+        # `signal_is_fresh` (entrada) e `market_data_temporally_current`
+        # (gate de ativação). O nome antigo prometia o que não media.
+        checks["data_reception_recent"] = not context.data_is_stale
         if context.data_is_stale:
             return "Dados de mercado desatualizados; operação recusada com dados obsoletos."
 
@@ -206,6 +229,30 @@ class RiskEngine:
         checks["actionable_signal"] = signal.direction in ("BUY", "SELL")
         if not checks["actionable_signal"]:
             return reject("actionable_signal", "Direção do sinal é AGUARDAR (HOLD); nada a avaliar.")
+
+        # Fase 3.3.1: BARREIRA DE FRESCOR -- somente ABERTURA. Roda logo
+        # após confirmar que o sinal é acionável e ANTES do dimensionamento
+        # e do gate de custos: um sinal defasado não merece nem ser
+        # medido. `evaluate_close` NUNCA consulta esta barreira, então
+        # fechar/reduzir/stop/alvo seguem possíveis com dado atrasado --
+        # que é exatamente quando mais se precisa deles.
+        if self.freshness_policy is not None:
+            freshness = evaluate_signal_freshness(
+                self.freshness_policy, signal.source_candle_open_time, context.now,
+            )
+            checks["signal_freshness"] = {"applied": True, **freshness.detail}
+            checks["signal_is_fresh"] = freshness.fresh
+            if not freshness.fresh:
+                return reject("signal_is_fresh", freshness.reason)
+        else:
+            # Nunca uma aprovação silenciosa: fica registrado que a
+            # barreira não rodou, e por quê -- a FONTE DE MERCADO deste
+            # modo é histórica (série gravada). O critério é a semântica
+            # temporal da fonte, NUNCA o tipo de ExecutionEngine: um modo
+            # que executa localmente mas consome mercado atual (PAPER_LIVE)
+            # continua integralmente protegido. Ver
+            # app/core/freshness.py::freshness_policy_for_market_data.
+            checks["signal_freshness"] = {"applied": False, "reason": HISTORICAL_DATA_REASON}
 
         checks["stop_loss_present"] = (not limits.require_stop_loss) or signal.stop_loss is not None
         if not checks["stop_loss_present"]:

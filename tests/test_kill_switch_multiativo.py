@@ -20,7 +20,7 @@ from app.core.config import RunMode, Settings
 from app.orchestrator import MultiSymbolOrchestrator, Orchestrator
 from app.persistence import repo
 from app.persistence.db import session_scope
-from tests.factories import activate_operational_state
+from tests.factories import activate_operational_state, make_portfolio_temporally_ready
 
 
 def _make_client(tmp_path, name, symbols):
@@ -128,6 +128,12 @@ def test_operational_state_activate_pause_unaffected_by_multiativo(tmp_path):
     usavam apenas o SystemState/OperationalSession globais, nunca um
     atributo privado do orquestrador."""
     client, orch = _make_client(tmp_path, "kill_other_routes.db", "BTCUSDT,ETHUSDT")
+    # Fase 3.3.1: ativar exige agora carteira pronta -- aquecimento
+    # concluído, saúde SAUDÁVEL, sem gap (e, em modos com dado ao vivo,
+    # série no presente). Um orquestrador que nunca ticou não atende
+    # nenhum desses, corretamente. O helper representa um sistema que
+    # já estava rodando; nenhuma asserção do teste muda.
+    make_portfolio_temporally_ready(orch)
 
     pause_resp = client.post("/api/operational-state/pause")
     assert pause_resp.status_code == 200

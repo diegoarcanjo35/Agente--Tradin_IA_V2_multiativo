@@ -94,7 +94,16 @@ def test_paper_live_still_refuses_production_and_testnet_hosts():
 # --- Functional: real market data drives a locally-simulated fill ----------
 
 def _generate_kline_rows(n_down: int, n_up: int) -> list[list[str]]:
-    start = datetime.now(timezone.utc) - timedelta(minutes=n_down + n_up + 5)
+    """Fase 3.3.1: mesma ancoragem no presente da versão de
+    `tests/test_bybit_demo_wiring.py` -- a série termina no último minuto
+    já fechado, e o minuto corrente é servido à parte como candle em
+    formação. Sem isso a série seria genuinamente velha e a barreira de
+    frescor recusaria, corretamente, o sinal que este teste precisa
+    aprovar."""
+    start = (
+        datetime.now(timezone.utc).replace(second=0, microsecond=0)
+        - timedelta(minutes=n_down + n_up)
+    )
     rows: list[list[str]] = []
     price = 100.0
     for i in range(n_down):
@@ -146,7 +155,7 @@ class _KlineSequenceTransport:
 def test_paper_live_fills_locally_from_real_market_data_never_posting_to_exchange():
     settings = make_paper_live_settings(risk_max_position_usd=50.0, risk_max_total_exposure_usd=50.0)
     base_transport = FakeBybitTransport()
-    rows = _generate_kline_rows(n_down=25, n_up=20)
+    rows = _generate_kline_rows(n_down=25, n_up=10)
     transport = _KlineSequenceTransport(base_transport, rows)
 
     orch = build_orchestrator(settings, bybit_transport=transport)

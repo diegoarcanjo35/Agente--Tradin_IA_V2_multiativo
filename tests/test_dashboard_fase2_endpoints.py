@@ -24,7 +24,7 @@ def make_client(tmp_path, name):
         database_url=f"sqlite:///{tmp_path / name}",
     )
     base_transport = FakeBybitTransport()
-    rows = _generate_kline_rows(n_down=25, n_up=20)
+    rows = _generate_kline_rows(n_down=25, n_up=10)
     transport = _KlineSequenceTransport(base_transport, rows)
     orch = build_orchestrator(settings, bybit_transport=transport)
     activate_operational_state(orch)

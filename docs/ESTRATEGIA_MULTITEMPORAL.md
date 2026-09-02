@@ -424,6 +424,151 @@ cada símbolo** (mesma `_resolve_mark_price` da equity e do gráfico, fonte
 escondia justamente a prova de que cada série tem preço próprio. `None`
 continua sendo N/D quando genuinamente não há preço.
 
+## 12.2 Frescor, atualidade e recepção (Fase 3.3.1)
+
+Três conceitos que estavam colapsados num só. Confundi-los foi o que
+permitiu, em 01/09, autorizar a carteira com 185 minutos de defasagem
+enquanto tudo reportava saúde plena.
+
+| Conceito | O que mede | Onde atua |
+|---|---|---|
+| `data_reception_recent` | `utcnow() - provider._last_received_at` — saúde da **conexão** | check no `RiskEngine` (era `data_fresh`) |
+| `market_data_temporally_current` | idade do último **candle fechado** de 1 min | gate de ativação e `/api/state` |
+| `signal_is_fresh` | idade do **sinal**, a partir do fechamento do bucket estratégico | check no `RiskEngine`, só ABERTURA |
+
+**Por que o nome antigo enganava.** `data_fresh` prometia frescor de dado
+e entregava recência de recepção: durante a drenagem de um backlog,
+candles de quatro horas atrás são "recebidos agora" e o check passa —
+corretamente, porque a conexão está viva. O nome é que estava errado.
+Registros históricos com a chave `data_fresh` continuam legíveis
+(`repo.rejection_reasons` reconhece as duas); nada foi reescrito.
+
+### A fórmula do frescor
+
+```
+bucket_close_time    = source_candle_open_time + duração do timeframe estratégico
+signal_delay_seconds = now - bucket_close_time
+
+fresco  <=>  -tolerância_futuro <= signal_delay_seconds <= MAX_SIGNAL_DELAY_AFTER_CLOSE_SECONDS
+```
+
+Medido a partir do **fechamento**, nunca da abertura: um sinal de 5
+minutos nasce, por construção, ~5 minutos depois da abertura do bucket.
+Medir desde o `open_time` contaria a duração do próprio candle como
+atraso e recusaria todo sinal legítimo.
+
+- **`MAX_SIGNAL_DELAY_AFTER_CLOSE_SECONDS` = 300** (padrão). Unidade:
+  segundos, contados **após o fechamento** do bucket.
+- O limite é **INCLUSIVO**: exatamente no limite é ACEITO.
+- Tolerância de 2 s para timestamp levemente no futuro (diferença de
+  relógio entre corretora e máquina local é normal). Além disso, recusa.
+- `source_candle_open_time` ausente → recusa. Timeframe inválido →
+  recusa. Nunca aprovação por omissão.
+- Tudo UTC-aware; horário local não é usado em ponto algum do cálculo.
+
+### Entradas bloqueadas, saídas sempre permitidas
+
+A barreira vale **somente** para abertura/aumento de exposição. Nunca
+bloqueiam por frescor: fechamento, redução, stop-loss, take-profit,
+liquidação de segurança, reconciliação e kill-switch. `evaluate_close`
+sequer consulta a política — uma saída de proteção precisa continuar
+possível justamente quando o dado está atrasado.
+
+Ordem no `RiskEngine`: `actionable_signal` → **`signal_is_fresh`** →
+dimensionamento → `cost_gate`. Um sinal defasado não chega a ser medido
+pelo gate de custos.
+
+### O que decide se a barreira se aplica: a fonte de mercado
+
+O critério é a **semântica temporal da fonte de mercado** do modo —
+**nunca** o tipo de `ExecutionEngine`:
+
+| Semântica | Significado | Barreira |
+|---|---|---|
+| `live` | os timestamps do candle acompanham o presente | **aplica** |
+| `historical` | série gravada; os timestamps são do passado | não se aplica |
+
+`PAPER_LIVE` executa localmente, com `PaperLocalExecutionEngine`, e ainda
+assim consome **mercado público atual**: sua fonte é `live` e ele fica
+**integralmente protegido**. Usar um motor de execução local não desativa
+proteção nenhuma. Um modo **não mapeado** cai em `live` por padrão — o
+default é seguro, e esquecer de mapear um modo novo nunca desliga a
+barreira em silêncio.
+
+Fonte `historical` (a fixture de REPLAY é de 2024-01-01): compará-la com o
+relógio de parede mediria a idade do **arquivo**, não risco, e recusaria
+100% dos sinais para sempre. Aí a política **não se aplica**, e a ausência
+fica registrada explicitamente em `checks["signal_freshness"] =
+{"applied": false, "reason": "market_data_is_historical_in_this_mode"}` —
+nunca como aprovação silenciosa. Ver
+`app/core/freshness.py::freshness_policy_for_market_data`.
+
+*Alternativa considerada e descartada:* usar o tempo do próprio candle
+como "agora" na fonte histórica. Ficaria elegante, mas o mesmo mecanismo
+aplicado a uma fonte `live` tornaria o atraso SEMPRE zero durante uma
+drenagem de backlog — exatamente o cenário que a barreira existe para
+impedir.
+
+### Gate temporal de ativação
+
+`POST /api/operational-state/activate` passou a exigir, **por símbolo**:
+saúde SAUDÁVEL, `has_gap=false`, zero falhas consecutivas, sem erro
+impeditivo, aquecimento concluído e série no presente. É **atômico**: um
+único símbolo bloqueador impede a carteira inteira de ficar ATIVA. A
+resposta nomeia o símbolo, o atraso medido, o limite e o último candle.
+
+O limite de atualidade é **exatamente**
+`MAX_SIGNAL_DELAY_AFTER_CLOSE_SECONDS` (300 s com os padrões), decisão do
+PO. A duração do bucket estratégico **não** é somada de novo: a idade já é
+contada a partir do **fechamento** do candle, então somá-la contaria duas
+vezes o mesmo intervalo.
+
+Coerência exigida: se um sinal não pode virar entrada acima dessa janela,
+o endpoint de ativação não pode declarar pronta uma carteira que já a
+ultrapassou. Ativação e barreira de entrada falam a mesma língua — 300 s
+dos dois lados. A margem sobre o backlog real da Fase 3.3 (185 min)
+continua sendo de 37×.
+
+A instância **nunca** restaura ATIVO automaticamente após boot, queda ou
+reinício: `app/api/main.py` força OBSERVANDO em todo boot, e isso
+continua valendo.
+
+## 12.3 Instrumentação da cobertura e contagens (Fase 3.3.1)
+
+`GET /api/metrics` passou a expor, global e por símbolo:
+
+- `cost_gate.coverage_distribution`: avaliadas, aprovadas, rejeitadas,
+  `min`, `p50`, `mean`, `p90`, `max`, e as faixas `below_1x`,
+  `between_1x_2x`, `between_2x_3x`, `at_or_above_3x`;
+- `signal_counts`: `signals_total`, `actionable_signals_total`,
+  `hold_signals_total`, `by_direction`;
+- `rejection_reasons`: contagem por check que falhou e o motivo dominante;
+- `temporal_currency` por símbolo.
+
+Regras: amostra vazia devolve `None` em todas as estatísticas, nunca
+zero; cobertura nula (custo configurado igual a zero) é contada à parte
+em `samples_without_ratio`, nunca tratada como zero; percentil
+determinístico por *nearest-rank*, sem interpolação — o valor devolvido é
+sempre um valor **observado**; nenhum arredondamento antes do cálculo.
+
+As contagens vêm de consulta canônica ao banco (`repo.signal_counts`),
+**nunca** de `/api/signals?limit=N` — foi assim que a auditoria da Fase
+3.3 reportou 200 sinais quando eram 257.
+
+## 12.4 O que NÃO mudou nesta fase
+
+Registrado para não haver dúvida de que nenhum controle foi afrouxado
+para produzir operação:
+
+- timeframe estratégico continua **5 minutos** — e continua em avaliação;
+- `minimum_cost_coverage_ratio` continua **3,0×**, não foi afrouxado;
+- `strategy_expected_move_atr_multiple` continua **1× ATR**;
+- taxas e slippage inalterados; **5 bps continuam sendo estimativa
+  configurada, nunca medida** (não houve execução para medir);
+- `risk_max_concurrent_positions` continua **1** — decisão conservadora
+  inicial, herdada da Fase 1, ainda pendente de decisão do PO;
+- estratégia continua SMA 9/21, stop 2× ATR, alvo 3× ATR.
+
 ## 13. Limitações conhecidas
 
 - Menos decisões: em 5m a estratégia avalia 1/5 das vezes. É o objetivo,

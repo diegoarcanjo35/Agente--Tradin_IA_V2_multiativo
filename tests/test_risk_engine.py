@@ -108,7 +108,10 @@ def test_rejects_on_stale_data():
     ctx = base_context(data_is_stale=True)
     result = engine.evaluate(make_signal(), signal_id=1, context=ctx)
     assert not result.approved
-    assert not result.checks["data_fresh"]
+    # Fase 3.3.1: renomeado de `data_fresh` para `data_reception_recent` --
+    # o check mede recência de RECEPÇÃO (saúde da conexão), nunca a idade
+    # do candle. Quem mede idade de dado agora é `signal_is_fresh`.
+    assert not result.checks["data_reception_recent"]
 
 
 def test_rejects_when_trading_blocked():
