@@ -1336,6 +1336,29 @@ class MultiSymbolOrchestrator:
         # above -- one shared dict across every symbol.
         return next(iter(self.orchestrators.values())).visual_price_state
 
+    @property
+    def shadow_engine(self):
+        # Fase 3.4.4: mesmo padrão de delegação de `execution_engine` e
+        # `risk_engine` -- UMA única instância de ShadowEngine é injetada em
+        # todos os Orchestrator por símbolo (ver
+        # app/api/main.py::build_orchestrator), porque os portfólios
+        # contrafactuais têm exposição GLOBAL, igual à operação. Qualquer
+        # filho expõe a mesma instância; nada é criado, agregado ou somado
+        # aqui.
+        #
+        # Sem esta property, `getattr(orch, "shadow_engine", None)` em
+        # app/api/routes_shadow.py::shadow_health devolvia None sempre que a
+        # instância era multiativa -- ou seja, na única configuração que roda
+        # de verdade -- e a saúde da instrumentação aparecia como DESLIGADA
+        # enquanto a coleta funcionava normalmente. As demais rotas shadow
+        # nunca foram afetadas: elas usam `session_factory`, que já era
+        # delegado.
+        #
+        # Em modo sem shadow, cada Orchestrator carrega `shadow_engine=None`
+        # e esta property devolve None -- exatamente o valor que a rota já
+        # trata, respondendo {"enabled": False, "status": "DESLIGADO"}.
+        return next(iter(self.orchestrators.values())).shadow_engine
+
     def hydrate_strategy_state(self, session) -> dict:
         """Fase 3.2: hidrata o estado estratégico de CADA símbolo, cada um
         com o seu próprio agregador e o seu próprio StrategyEngine (estado
