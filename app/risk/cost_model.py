@@ -72,6 +72,48 @@ class CostGateResult:
 _MIN_VALID_PRICE_FRACTION = 1e-8
 
 
+def adverse_fill_price(reference_price: float, side: str, slippage_fraction: float) -> float:
+    """FUNÇÃO CANÔNICA do preço adverso estimado de preenchimento.
+
+    Slippage ADVERSO: comprando paga-se MAIS, vendendo recebe-se MENOS.
+
+        BUY  -> preço × (1 + s)
+        SELL -> preço × (1 - s)
+
+    Existe uma única definição porque a Fase 3.4.1 provou o custo de haver
+    duas: o dimensionamento usava o preço do SINAL enquanto a exposição
+    persistida usava o preço PREENCHIDO, e a diferença de `position_usd × s`
+    virava resíduo — que o motor transformava em posições degenerádas em
+    cascata (US$ 0,025 → 0,0000125 → ...), além de fazer a primeira compra
+    nascer US$ 0,025 acima do teto global.
+
+    Quem aplica o slippage de verdade continua sendo o ExecutionEngine.
+    Esta função apenas ESTIMA o mesmo número para dimensionar antes,
+    de modo que `qty × preço_preenchido` respeite o `position_usd`
+    aprovado. Nunca chame isto no caminho de execução: seria aplicar
+    slippage duas vezes.
+
+    LIMITAÇÃO EXPLÍCITA DO ALCANCE DESTA GARANTIA (Fase 3.4.2)
+    A igualdade exata `qty × preço_preenchido == position_usd` só é
+    garantida quando o preenchimento é DETERMINÍSTICO e usa exatamente
+    este mesmo slippage -- isto é, no `PaperLocalExecutionEngine`.
+
+    Ela NÃO vale, e não se pretende que valha, quando:
+      - não existe `cost_model` (o dimensionamento cai no preço do
+        sinal, como antes, por não haver slippage conhecido);
+      - o preenchimento real diverge do slippage estimado, que é o caso
+        de qualquer corretora de verdade (BYBIT_DEMO inclusive): lá o
+        preço vem do livro, não de uma fração fixa, e o notional final
+        pode ficar acima ou abaixo do teto.
+
+    Resolver o teto sob execução real exige outro mecanismo (reserva de
+    margem, verificação pós-fill ou redução ativa) e está fora do escopo
+    desta fase."""
+    if side == "BUY":
+        return reference_price * (1.0 + slippage_fraction)
+    return reference_price * (1.0 - slippage_fraction)
+
+
 def evaluate_cost_gate(
     model: CostModel, side: str, qty: float, entry_reference_price: float, atr: float,
 ) -> CostGateResult:
@@ -167,21 +209,14 @@ def evaluate_cost_gate(
         )
 
     # --- perna de ENTRADA -------------------------------------------------
-    # Slippage ADVERSO: comprando, paga-se MAIS; vendendo, recebe-se MENOS.
-    if side == "BUY":
-        entry_fill_price = entry_reference_price * (1.0 + slip)
-    else:
-        entry_fill_price = entry_reference_price * (1.0 - slip)
+    entry_fill_price = adverse_fill_price(entry_reference_price, side, slip)
     entry_notional_usd = entry_fill_price * qty
     entry_fee_usd = entry_notional_usd * model.fee_rate
     entry_slippage_usd = abs(entry_fill_price - entry_reference_price) * qty
 
     # --- perna de SAÍDA (lado oposto, notional PRÓPRIO) -------------------
     exit_side = "SELL" if side == "BUY" else "BUY"
-    if exit_side == "BUY":
-        exit_fill_price = projected_exit_price * (1.0 + slip)
-    else:
-        exit_fill_price = projected_exit_price * (1.0 - slip)
+    exit_fill_price = adverse_fill_price(projected_exit_price, exit_side, slip)
     exit_notional_usd = exit_fill_price * qty
     exit_fee_usd = exit_notional_usd * model.fee_rate
     exit_slippage_usd = abs(exit_fill_price - projected_exit_price) * qty

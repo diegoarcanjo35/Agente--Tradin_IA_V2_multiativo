@@ -323,6 +323,11 @@ class Settings(BaseSettings):
     # Risk defaults (conservative). See app/risk/config.py for the dataclass
     # these seed and full documentation of each limit.
     risk_max_position_usd: float = Field(default=50.0)
+    # Fase 3.4.2: piso econômico da ordem. Uma sobra de exposição menor que
+    # este valor é RECUSADA com motivo próprio, nunca arredondada para cima
+    # nem aberta como posição degenerada. Ver `_validate_min_order_notional`
+    # para a relação obrigatória com RISK_MAX_POSITION_USD.
+    risk_min_order_notional_usd: float = Field(default=5.0)
     risk_max_concurrent_positions: int = Field(default=1)
     risk_max_daily_loss_usd: float = Field(default=25.0)
     risk_max_total_exposure_usd: float = Field(default=50.0)
@@ -555,6 +560,30 @@ class Settings(BaseSettings):
                 f"MAX_SIGNAL_DELAY_AFTER_CLOSE_SECONDS deve ser maior que zero; recebido {v!r}."
             )
         return v
+
+    @model_validator(mode="after")
+    def _validate_min_order_notional(self):
+        """Fase 3.4.2. O piso precisa ser estritamente positivo e nunca
+        maior que o tamanho máximo de posição -- um piso acima do teto
+        tornaria TODA entrada impossível, e de forma silenciosa: cada
+        sinal seria recusado por `below_minimum_order_notional` sem que
+        nada indicasse erro de configuração."""
+        v = self.risk_min_order_notional_usd
+        if not math.isfinite(v):
+            raise ValueError(
+                f"RISK_MIN_ORDER_NOTIONAL_USD deve ser finito; recebido {v!r}."
+            )
+        if v <= 0:
+            raise ValueError(
+                f"RISK_MIN_ORDER_NOTIONAL_USD deve ser maior que zero; recebido {v!r}."
+            )
+        if v > self.risk_max_position_usd:
+            raise ValueError(
+                f"RISK_MIN_ORDER_NOTIONAL_USD ({v}) não pode ser maior que "
+                f"RISK_MAX_POSITION_USD ({self.risk_max_position_usd}): nenhuma entrada "
+                "seria possível."
+            )
+        return self
 
     @field_validator("strategy_timeframe_minutes")
     @classmethod

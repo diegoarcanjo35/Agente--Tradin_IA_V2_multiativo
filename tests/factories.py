@@ -108,6 +108,14 @@ def approved_open_order(
     position_usd = qty * price
     engine = RiskEngine(RiskLimits(
         max_position_usd=position_usd, max_total_exposure_usd=position_usd,
+        # Fase 3.4.2: esta fábrica já fixa TODOS os limites de tamanho no
+        # valor pedido, para que a ordem saia com exatamente `qty`. O piso
+        # de notional entra na mesma lista pelo mesmo motivo -- do
+        # contrário, fixtures que pedem ordens pequenas (US$ 0,10) seriam
+        # recusadas por uma política de carteira que não é o objeto do
+        # teste. O comportamento REAL do piso é coberto, com os números de
+        # produção, em tests/test_sizing_and_min_notional.py.
+        min_order_notional_usd=min(RiskLimits().min_order_notional_usd, position_usd),
         require_stop_loss=stop_loss is not None,
     ))
     signal = Signal(

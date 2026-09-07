@@ -34,7 +34,15 @@ from app.core.freshness import (
     evaluate_signal_freshness,
 )
 from app.risk.config import RiskLimits
-from app.risk.cost_model import CostModel, evaluate_cost_gate
+from app.risk.cost_model import CostModel, adverse_fill_price, evaluate_cost_gate
+
+# Fase 3.4.2: tolerância numérica do piso de notional. Existe porque
+# `position_usd` vem de subtrações em ponto flutuante (teto − exposição
+# somada), e um valor conceitualmente igual a US$ 5,00 pode chegar aqui
+# como 4,999999999999999. Um centésimo de centavo é grande o bastante
+# para absorver esse erro e pequeno o bastante para nunca aceitar uma
+# ordem economicamente diferente do piso: US$ 4,99 continua recusado.
+_NOTIONAL_TOLERANCE_USD = 1e-4
 from app.strategy.schemas import Signal
 
 
@@ -290,7 +298,43 @@ class RiskEngine:
         if not checks["position_size_positive"]:
             return reject("position_size_positive", "Tamanho de posição calculado não é positivo.")
 
-        qty = position_usd / signal.observed_price
+        # Fase 3.4.2, piso econômico. Antes desta fase o único portão era
+        # `position_usd > 0`, e a auditoria flagrou o motor abrindo posição
+        # com US$ 0,0000125 de notional. A sobra NUNCA é arredondada para o
+        # mínimo: se não alcança o piso, a entrada é recusada com motivo
+        # próprio, distinto de "não há exposição nenhuma"
+        # (`exposure_room_available`).
+        checks["minimum_order_notional_ok"] = (
+            position_usd >= limits.min_order_notional_usd - _NOTIONAL_TOLERANCE_USD
+        )
+        if not checks["minimum_order_notional_ok"]:
+            return reject(
+                "below_minimum_order_notional",
+                f"Notional disponível (USD {position_usd:.8f}) é menor que o mínimo "
+                f"operacional (USD {limits.min_order_notional_usd:.2f}). A sobra de "
+                "exposição é economicamente irrelevante e não vira ordem.",
+            )
+
+        # Fase 3.4.2, coerência de preço. `qty` passa a ser dimensionada
+        # pelo preço ADVERSO estimado -- o mesmo que o ExecutionEngine vai
+        # praticar -- e não mais pelo preço do sinal. Sem isso,
+        # `qty × preço_preenchido` excedia `position_usd` em
+        # `position_usd × slippage`: a primeira compra nascia US$ 0,025
+        # acima do teto global e a sobra das vendas virava posição
+        # degenerada em cascata (diagnóstico da Fase 3.4.1).
+        #
+        # Quem APLICA o slippage continua sendo o ExecutionEngine; aqui ele
+        # é apenas ESTIMADO para dimensionar. Não há dupla aplicação.
+        if self.cost_model is not None:
+            sizing_price = adverse_fill_price(
+                signal.observed_price, signal.direction, self.cost_model.slippage_fraction,
+            )
+        else:
+            # Sem modelo de custo não há slippage conhecido: mantém o
+            # comportamento anterior em vez de inventar um número.
+            sizing_price = signal.observed_price
+        checks["sizing_reference_price"] = sizing_price
+        qty = position_usd / sizing_price
 
         # Fase 3.2: gate de VIABILIDADE LÍQUIDA -- último check antes da
         # aprovação, porque é o primeiro momento em que `qty` existe (o

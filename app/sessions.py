@@ -224,6 +224,10 @@ def _sanitized_config_snapshot(settings) -> dict:
         # `_config_fingerprint` for why order is preserved, not sorted.
         "symbols": list(settings.symbols),
         "risk_max_position_usd": settings.risk_max_position_usd,
+        # Fase 3.4.2: entra no fingerprint -- mudar o piso de notional
+        # muda quais entradas sao possiveis, entao caracteriza uma nova
+        # sessao operacional (a base contabil so muda com o saldo).
+        "risk_min_order_notional_usd": settings.risk_min_order_notional_usd,
         "risk_max_concurrent_positions": settings.risk_max_concurrent_positions,
         "risk_max_daily_loss_usd": settings.risk_max_daily_loss_usd,
         "risk_max_total_exposure_usd": settings.risk_max_total_exposure_usd,

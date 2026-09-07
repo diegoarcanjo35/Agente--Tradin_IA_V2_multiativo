@@ -269,6 +269,7 @@ def build_orchestrator(settings, bybit_transport=None) -> Orchestrator | MultiSy
 
     risk_limits = RiskLimits(
         max_position_usd=settings.risk_max_position_usd,
+        min_order_notional_usd=settings.risk_min_order_notional_usd,
         max_concurrent_positions=settings.risk_max_concurrent_positions,
         max_daily_loss_usd=settings.risk_max_daily_loss_usd,
         max_total_exposure_usd=settings.risk_max_total_exposure_usd,

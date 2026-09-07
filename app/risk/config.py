@@ -9,6 +9,12 @@ class RiskLimits:
     defaults themselves are intentionally tight for a Fase 1 demo system."""
 
     max_position_usd: float = 50.0
+    # Fase 3.4.2: piso ECONÔMICO da ordem. Antes, o único portão de tamanho
+    # era `position_usd > 0`, e uma sobra de exposição de US$ 0,0000125
+    # virava posição válida. Um resíduo abaixo deste piso é recusado com
+    # motivo próprio (`below_minimum_order_notional`) -- nunca arredondado
+    # para cima.
+    min_order_notional_usd: float = 5.0
     max_concurrent_positions: int = 1
     max_daily_loss_usd: float = 25.0
     max_total_exposure_usd: float = 50.0
