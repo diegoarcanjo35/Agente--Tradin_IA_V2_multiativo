@@ -71,8 +71,14 @@ class Orchestrator:
         price_state: dict[str, float] | None = None,
         funding_provider: "BybitFundingProvider | None" = None,
         visual_price_state: dict[str, dict] | None = None,
+        shadow_engine=None,
     ):
         self.settings = settings
+        # Fase 3.4.3: instrumentacao SHADOW, opcional e sem qualquer
+        # poder operacional. Todo uso e' embrulhado em try/except: uma
+        # falha aqui nunca interrompe o tick, nunca degrada a saude de
+        # mercado e nunca bloqueia decisao. Ver app/shadow/engine.py.
+        self.shadow_engine = shadow_engine
         self.session_factory = session_factory
         self.market_data_provider = market_data_provider
         self.strategy_engine = strategy_engine
@@ -294,6 +300,23 @@ class Orchestrator:
             # A nova ENTRADA, essa sim, é abandonada logo após a agregação.
             stop_take_result = self._check_stop_take(session, state, candle, data_is_stale, clock_sync)
 
+            # SHADOW: stop/alvo hipoteticos no mesmo candle de 1 min.
+            #
+            # SAVEPOINT, nao apenas try/except. Depois de um IntegrityError ou
+            # de falha durante flush, a sessao SQLAlchemy fica em estado
+            # invalido e o COMMIT OPERACIONAL falharia junto -- a
+            # instrumentacao derrubaria a operacao que ela deveria apenas
+            # observar. `begin_nested()` abre uma transacao aninhada
+            # (SAVEPOINT); revertendo so' ela, a transacao operacional
+            # permanece utilizavel e o tick termina normalmente.
+            self._run_shadow(
+                session, lambda: self.shadow_engine.on_operational_candle(
+                    session, candle.symbol, candle.high, candle.low,
+                    candle.close, candle.open_time,
+                ),
+                operacao="on_operational_candle",
+            )
+
             # Fase 3.2: o candle de 1 minuto SEMPRE alimenta o agregador --
             # ele já foi persistido e exibido acima, e a agregação é
             # puramente derivada.
@@ -346,6 +369,21 @@ class Orchestrator:
                 source_candle_open_time=signal.source_candle_open_time,
             )
             increment_session_counter(op_session, "signals_count")
+
+            # SHADOW: oportunidade contrafactual do bucket recem-fechado.
+            # Recebe os indicadores JA calculados pela estrategia -- nao
+            # recalcula nada e nao pode alterar o sinal.
+            if signal.direction in ("BUY", "SELL"):
+                self._run_shadow(
+                    session, lambda: self.shadow_engine.on_strategy_signal(
+                        session, signal.symbol, signal.direction,
+                        signal.observed_price, signal.atr,
+                        signal.params.get("fast_sma"), signal.params.get("slow_sma"),
+                        signal.source_candle_open_time,
+                        tick_candle_time=candle.open_time,
+                    ),
+                    operacao="on_strategy_signal",
+                )
 
             self._run_ai_shadow(
                 session, state, op_session, signal, signal_row.id, strategy_candle.close,
@@ -618,6 +656,38 @@ class Orchestrator:
                 "Saída da IA inválida ou indisponível.", [], result.provider_name,
                 result.model_version, False, result.rejection_reason,
             )
+
+    def _run_shadow(self, session, acao, operacao: str = "shadow") -> None:
+        """Executa uma escrita SHADOW dentro de um SAVEPOINT.
+
+        Garantias:
+          - o `flush()` acontece DENTRO do savepoint, entao uma violacao de
+            constraint suja apenas a transacao aninhada;
+          - em falha, so' o savepoint e' revertido -- NUNCA
+            `session.rollback()` da transacao operacional;
+          - a sessao continua utilizavel, e o candle/sinal ja persistidos
+            neste tick seguem para o commit normalmente;
+          - a falha e' registrada na saude do shadow, que vive em MEMORIA e
+            portanto nao depende da escrita que acabou de falhar.
+        """
+        if self.shadow_engine is None:
+            return
+        try:
+            # Forma de CONTEXTO, de proposito. A versao manual anterior
+            # checava `savepoint.is_active` antes de reverter -- e depois de
+            # um IntegrityError no flush o savepoint ja esta DESATIVADO,
+            # entao a reversao nunca acontecia e a transacao externa ficava
+            # envenenada (PendingRollbackError no commit operacional). O
+            # gerenciador de contexto reverte ao savepoint em qualquer
+            # excecao, sem depender desse estado.
+            with session.begin_nested():
+                acao()
+                session.flush()      # dentro do savepoint, de proposito
+            # Sucesso creditado a ESTA operacao apenas: um hook saudavel
+            # nunca pode limpar o historico consecutivo de outro que falha.
+            self.shadow_engine.record_success(operacao)
+        except Exception as exc:  # noqa: BLE001 - instrumentacao nunca derruba o tick
+            self.shadow_engine.record_failure(exc, operacao)
 
     def _check_stop_take(self, session, state, candle, data_is_stale: bool, clock_sync) -> dict | None:
         """Evaluates stop-loss/take-profit for the open position (if any) on

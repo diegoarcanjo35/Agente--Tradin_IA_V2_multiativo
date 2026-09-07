@@ -393,3 +393,196 @@ class SystemState(Base):
         ForeignKey("operational_sessions.id"), nullable=True
     )
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+
+
+# ---------------------------------------------------------------------------
+# SHADOW (Fase 3.4.3) — instrumentação contrafactual, ISOLADA da operação.
+#
+# Estas três tabelas NUNCA se relacionam com orders/executions/positions nem
+# com o patrimônio ou a sessão contábil operacional. Não há ForeignKey para
+# nenhuma delas, de propósito: um registro shadow não pode, nem por engano de
+# join, virar ou influenciar uma ordem real. O shadow observa e mede; quem
+# decide operação continua sendo RiskEngine + gate operacional.
+#
+# Toda coluna temporal guarda o TEMPO DO CANDLE que provocou o evento, nunca
+# o relógio de parede -- é o instante econômico do evento, e é o que torna o
+# resultado reproduzível num reprocessamento.
+# ---------------------------------------------------------------------------
+
+
+class ShadowOpportunity(Base):
+    """Uma decisão hipotética por (modelo, símbolo, bucket estratégico).
+
+    Persistida para TODO sinal acionável, tenha o modelo aprovado ou não --
+    é o denominador das métricas. A chave única torna o reprocessamento do
+    mesmo candle um no-op no banco."""
+
+    __tablename__ = "shadow_opportunities"
+    __table_args__ = (
+        # A identidade inclui o EXPERIMENTO: o mesmo simbolo/candle pode
+        # aparecer legitimamente em experimentos diferentes.
+        UniqueConstraint(
+            "experiment_id", "symbol", "source_candle_open_time",
+            name="uq_shadow_opportunity_experiment_symbol_candle",
+        ),
+        Index("ix_shadow_opportunity_model_time", "model", "source_candle_open_time"),
+        CheckConstraint("atr > 0", name="ck_shadow_opportunity_atr_positive"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    experiment_id: Mapped[int] = mapped_column(Integer, index=True)
+    model: Mapped[str] = mapped_column(String(64), index=True)
+    hypothesis_version: Mapped[str] = mapped_column(String(32))
+    symbol: Mapped[str] = mapped_column(String(32), index=True)
+    # Instante econômico: abertura do bucket estratégico que gerou o sinal.
+    source_candle_open_time: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    strategy_timeframe_minutes: Mapped[int] = mapped_column(Integer)
+    direction: Mapped[str] = mapped_column(String(8))
+    reference_price: Mapped[float] = mapped_column(Float)
+    fast_sma: Mapped[float] = mapped_column(Float)
+    slow_sma: Mapped[float] = mapped_column(Float)
+    atr: Mapped[float] = mapped_column(Float)
+    # abs(fast - slow) / atr -- a grandeza congelada do H2.
+    normalized_separation: Mapped[float] = mapped_column(Float)
+    # ATR% / custo de ida e volta -- observada, NUNCA usada como filtro aqui.
+    cost_coverage_ratio: Mapped[float | None] = mapped_column(Float, nullable=True)
+    approved: Mapped[bool] = mapped_column(Boolean)
+    reason: Mapped[str] = mapped_column(Text)
+    warmup_ready: Mapped[bool] = mapped_column(Boolean, default=True)
+    signal_is_fresh: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    # Só para COMPARAÇÃO: o que o gate operacional de 3,0x teria decidido.
+    # Não participa de nenhuma decisão shadow.
+    operational_gate_would_approve: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class ShadowPosition(Base):
+    """Posição hipotética aberta. Uma por modelo por vez, no máximo, porque
+    cada portfólio respeita o mesmo teto de exposição global da operação."""
+
+    __tablename__ = "shadow_positions"
+    __table_args__ = (
+        UniqueConstraint(
+            "experiment_id", "symbol", "opened_candle_time",
+            name="uq_shadow_position_experiment_symbol_open",
+        ),
+        Index("ix_shadow_position_model_status", "model", "status"),
+        CheckConstraint("qty > 0", name="ck_shadow_position_qty_positive"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    experiment_id: Mapped[int] = mapped_column(Integer, index=True)
+    model: Mapped[str] = mapped_column(String(64), index=True)
+    symbol: Mapped[str] = mapped_column(String(32), index=True)
+    side: Mapped[str] = mapped_column(String(8))
+    qty: Mapped[float] = mapped_column(Float)
+    # Preenchimento HIPOTÉTICO (preço adverso estimado). Nunca houve ordem.
+    entry_fill_price: Mapped[float] = mapped_column(Float)
+    reference_price: Mapped[float] = mapped_column(Float)
+    notional_usd: Mapped[float] = mapped_column(Float)
+    stop_loss: Mapped[float] = mapped_column(Float)
+    take_profit: Mapped[float] = mapped_column(Float)
+    entry_fee_usd: Mapped[float] = mapped_column(Float)
+    entry_slippage_usd: Mapped[float] = mapped_column(Float)
+    atr_at_decision: Mapped[float] = mapped_column(Float)
+    normalized_separation: Mapped[float] = mapped_column(Float)
+    opened_candle_time: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    status: Mapped[str] = mapped_column(String(16), default="OPEN")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class ShadowTrade(Base):
+    """Trade hipotético encerrado -- o ledger de resultado do shadow."""
+
+    __tablename__ = "shadow_trades"
+    __table_args__ = (
+        UniqueConstraint(
+            "experiment_id", "symbol", "opened_candle_time", "closed_candle_time",
+            name="uq_shadow_trade_experiment_symbol_window",
+        ),
+        Index("ix_shadow_trade_model_closed", "model", "closed_candle_time"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    experiment_id: Mapped[int] = mapped_column(Integer, index=True)
+    model: Mapped[str] = mapped_column(String(64), index=True)
+    hypothesis_version: Mapped[str] = mapped_column(String(32))
+    symbol: Mapped[str] = mapped_column(String(32), index=True)
+    side: Mapped[str] = mapped_column(String(8))
+    qty: Mapped[float] = mapped_column(Float)
+    entry_fill_price: Mapped[float] = mapped_column(Float)
+    exit_fill_price: Mapped[float] = mapped_column(Float)
+    notional_usd: Mapped[float] = mapped_column(Float)
+    stop_loss: Mapped[float] = mapped_column(Float)
+    take_profit: Mapped[float] = mapped_column(Float)
+    exit_reason: Mapped[str] = mapped_column(String(32))
+    opened_candle_time: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    closed_candle_time: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    duration_minutes: Mapped[int] = mapped_column(Integer)
+    gross_pnl_usd: Mapped[float] = mapped_column(Float)
+    fees_usd: Mapped[float] = mapped_column(Float)
+    slippage_usd: Mapped[float] = mapped_column(Float)
+    net_pnl_usd: Mapped[float] = mapped_column(Float)
+    normalized_separation: Mapped[float] = mapped_column(Float)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+class ShadowExperiment(Base):
+    """IDENTIDADE IMUTÁVEL de um experimento shadow.
+
+    Existe para que métricas jamais misturem períodos com timeframes,
+    parâmetros de estratégia, custos, limites ou versões de hipótese
+    diferentes. Qualquer mudança em parâmetro relevante encerra o
+    experimento corrente e abre outro -- o antigo nunca é reescrito, e
+    uma posição shadow pertence para sempre ao experimento que a criou.
+
+    `config_fingerprint` é SHA-256 determinístico do snapshot sanitizado:
+    mesma configuração, mesmo fingerprint, em qualquer máquina."""
+
+    __tablename__ = "shadow_experiments"
+    __table_args__ = (
+        # NAO ha unicidade global em (model, config_fingerprint): o
+        # fingerprint identifica uma CONFIGURACAO, nao uma execucao. Voltar
+        # a uma configuracao antiga precisa criar uma execucao NOVA (A -> B
+        # -> A2), com uid e inicio proprios, para que as duas nunca sejam
+        # agregadas em silencio.
+        Index("ix_shadow_experiment_model_fingerprint", "model", "config_fingerprint"),
+        Index("ix_shadow_experiment_model_status", "model", "status"),
+        # No maximo UM experimento ATIVO por modelo, garantido pelo BANCO e
+        # nao pela disciplina da aplicacao. Indice PARCIAL: varios
+        # experimentos ENCERRADOS do mesmo modelo (inclusive com o mesmo
+        # fingerprint, como em A -> B -> A2) continuam legitimos. Declarado
+        # aqui alem da migration v9 para que um banco criado por
+        # `create_all` satisfaca o mesmo invariante que um banco migrado.
+        Index(
+            "uq_shadow_experiment_um_ativo_por_modelo", "model", unique=True,
+            sqlite_where=text("status = 'ATIVO'"),
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    experiment_uid: Mapped[str] = mapped_column(String(64), unique=True)
+    model: Mapped[str] = mapped_column(String(64), index=True)
+    hypothesis_version: Mapped[str] = mapped_column(String(32))
+    # Limiar CONGELADO desta hipótese. Mudá-lo cria experimento novo.
+    threshold: Mapped[float | None] = mapped_column(Float, nullable=True)
+    strategy_timeframe_minutes: Mapped[int] = mapped_column(Integer)
+    strategy_version: Mapped[str] = mapped_column(String(32))
+    fast_period: Mapped[int] = mapped_column(Integer)
+    slow_period: Mapped[int] = mapped_column(Integer)
+    atr_period: Mapped[int] = mapped_column(Integer)
+    fee_rate: Mapped[float] = mapped_column(Float)
+    slippage_bps: Mapped[float] = mapped_column(Float)
+    stop_loss_atr_multiple: Mapped[float] = mapped_column(Float)
+    take_profit_atr_multiple: Mapped[float] = mapped_column(Float)
+    max_position_usd: Mapped[float] = mapped_column(Float)
+    max_total_exposure_usd: Mapped[float] = mapped_column(Float)
+    min_order_notional_usd: Mapped[float] = mapped_column(Float)
+    max_daily_loss_usd: Mapped[float] = mapped_column(Float)
+    cooldown_after_losses: Mapped[int] = mapped_column(Integer)
+    cooldown_minutes: Mapped[int] = mapped_column(Integer)
+    config_fingerprint: Mapped[str] = mapped_column(String(64), index=True)
+    config_snapshot_json: Mapped[str] = mapped_column(Text)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    end_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    status: Mapped[str] = mapped_column(String(16), default="ATIVO")

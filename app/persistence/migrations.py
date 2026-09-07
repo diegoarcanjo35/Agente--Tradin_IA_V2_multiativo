@@ -93,7 +93,7 @@ from sqlalchemy.engine import Connection, Engine
 
 from app.persistence.models import Base
 
-CURRENT_SCHEMA_VERSION = 8
+CURRENT_SCHEMA_VERSION = 9
 
 
 class MigrationError(Exception):
@@ -581,6 +581,198 @@ def _migrate_to_v8(conn: Connection) -> None:
         ))
 
 
+def _migrate_to_v9(conn: Connection) -> None:
+    """Fase 3.4.3: cria as tres tabelas do motor SHADOW.
+
+    Sao tabelas NOVAS e isoladas -- nenhuma tabela operacional e' alterada,
+    nenhuma FK aponta para orders/executions/positions, e nada e' escrito
+    retroativamente. Por isso a migration e' puramente aditiva e nao precisa
+    de rebuild.
+
+    Idempotente por construcao: cada CREATE usa IF NOT EXISTS, e as chaves
+    unicas garantem que reprocessar o mesmo candle nao duplique registro."""
+    conn.execute(text("""
+        CREATE TABLE IF NOT EXISTS shadow_experiments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            experiment_uid VARCHAR(64) NOT NULL UNIQUE,  -- identidade da EXECUCAO
+            model VARCHAR(64) NOT NULL,
+            hypothesis_version VARCHAR(32) NOT NULL,
+            threshold FLOAT,
+            strategy_timeframe_minutes INTEGER NOT NULL,
+            strategy_version VARCHAR(32) NOT NULL,
+            fast_period INTEGER NOT NULL,
+            slow_period INTEGER NOT NULL,
+            atr_period INTEGER NOT NULL,
+            fee_rate FLOAT NOT NULL,
+            slippage_bps FLOAT NOT NULL,
+            stop_loss_atr_multiple FLOAT NOT NULL,
+            take_profit_atr_multiple FLOAT NOT NULL,
+            max_position_usd FLOAT NOT NULL,
+            max_total_exposure_usd FLOAT NOT NULL,
+            min_order_notional_usd FLOAT NOT NULL,
+            max_daily_loss_usd FLOAT NOT NULL,
+            cooldown_after_losses INTEGER NOT NULL,
+            cooldown_minutes INTEGER NOT NULL,
+            config_fingerprint VARCHAR(64) NOT NULL,
+            config_snapshot_json TEXT NOT NULL,
+            started_at DATETIME NOT NULL,
+            ended_at DATETIME,
+            end_reason TEXT,
+            status VARCHAR(16) NOT NULL DEFAULT 'ATIVO'
+        )
+    """))
+    # fingerprint e' ATRIBUTO INDEXADO, nunca exclusivo -- voltar a uma
+    # configuracao antiga cria execucao nova (A -> B -> A2).
+    conn.execute(text(
+        "CREATE INDEX IF NOT EXISTS ix_shadow_experiment_model_fingerprint "
+        "ON shadow_experiments (model, config_fingerprint)"))
+    # No maximo UM experimento ativo por modelo, garantido PELO BANCO --
+    # indice unico PARCIAL, nao disciplina da aplicacao.
+    conn.execute(text(
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_shadow_experiment_um_ativo_por_modelo "
+        "ON shadow_experiments (model) WHERE status = 'ATIVO'"))
+    conn.execute(text(
+        "CREATE INDEX IF NOT EXISTS ix_shadow_experiment_model_status "
+        "ON shadow_experiments (model, status)"))
+
+    conn.execute(text("""
+        CREATE TABLE IF NOT EXISTS shadow_opportunities (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            experiment_id INTEGER NOT NULL,
+            model VARCHAR(64) NOT NULL,
+            hypothesis_version VARCHAR(32) NOT NULL,
+            symbol VARCHAR(32) NOT NULL,
+            source_candle_open_time DATETIME NOT NULL,
+            strategy_timeframe_minutes INTEGER NOT NULL,
+            direction VARCHAR(8) NOT NULL,
+            reference_price FLOAT NOT NULL,
+            fast_sma FLOAT NOT NULL,
+            slow_sma FLOAT NOT NULL,
+            atr FLOAT NOT NULL,
+            normalized_separation FLOAT NOT NULL,
+            cost_coverage_ratio FLOAT,
+            approved BOOLEAN NOT NULL,
+            reason TEXT NOT NULL,
+            warmup_ready BOOLEAN NOT NULL DEFAULT 1,
+            signal_is_fresh BOOLEAN,
+            operational_gate_would_approve BOOLEAN,
+            created_at DATETIME NOT NULL,
+            CONSTRAINT ck_shadow_opportunity_atr_positive CHECK (atr > 0)
+        )
+    """))
+    conn.execute(text(
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_shadow_opportunity_experiment_symbol_candle "
+        "ON shadow_opportunities (experiment_id, symbol, source_candle_open_time)"))
+    conn.execute(text(
+        "CREATE INDEX IF NOT EXISTS ix_shadow_opportunity_model_time "
+        "ON shadow_opportunities (model, source_candle_open_time)"))
+
+    conn.execute(text("""
+        CREATE TABLE IF NOT EXISTS shadow_positions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            experiment_id INTEGER NOT NULL,
+            model VARCHAR(64) NOT NULL,
+            symbol VARCHAR(32) NOT NULL,
+            side VARCHAR(8) NOT NULL,
+            qty FLOAT NOT NULL,
+            entry_fill_price FLOAT NOT NULL,
+            reference_price FLOAT NOT NULL,
+            notional_usd FLOAT NOT NULL,
+            stop_loss FLOAT NOT NULL,
+            take_profit FLOAT NOT NULL,
+            entry_fee_usd FLOAT NOT NULL,
+            entry_slippage_usd FLOAT NOT NULL,
+            atr_at_decision FLOAT NOT NULL,
+            normalized_separation FLOAT NOT NULL,
+            opened_candle_time DATETIME NOT NULL,
+            status VARCHAR(16) NOT NULL DEFAULT 'OPEN',
+            created_at DATETIME NOT NULL,
+            CONSTRAINT ck_shadow_position_qty_positive CHECK (qty > 0)
+        )
+    """))
+    conn.execute(text(
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_shadow_position_experiment_symbol_open "
+        "ON shadow_positions (experiment_id, symbol, opened_candle_time)"))
+    conn.execute(text(
+        "CREATE INDEX IF NOT EXISTS ix_shadow_position_model_status "
+        "ON shadow_positions (model, status)"))
+
+    conn.execute(text("""
+        CREATE TABLE IF NOT EXISTS shadow_trades (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            experiment_id INTEGER NOT NULL,
+            model VARCHAR(64) NOT NULL,
+            hypothesis_version VARCHAR(32) NOT NULL,
+            symbol VARCHAR(32) NOT NULL,
+            side VARCHAR(8) NOT NULL,
+            qty FLOAT NOT NULL,
+            entry_fill_price FLOAT NOT NULL,
+            exit_fill_price FLOAT NOT NULL,
+            notional_usd FLOAT NOT NULL,
+            stop_loss FLOAT NOT NULL,
+            take_profit FLOAT NOT NULL,
+            exit_reason VARCHAR(32) NOT NULL,
+            opened_candle_time DATETIME NOT NULL,
+            closed_candle_time DATETIME NOT NULL,
+            duration_minutes INTEGER NOT NULL,
+            gross_pnl_usd FLOAT NOT NULL,
+            fees_usd FLOAT NOT NULL,
+            slippage_usd FLOAT NOT NULL,
+            net_pnl_usd FLOAT NOT NULL,
+            normalized_separation FLOAT NOT NULL,
+            created_at DATETIME NOT NULL
+        )
+    """))
+    conn.execute(text(
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_shadow_trade_experiment_symbol_window "
+        "ON shadow_trades (experiment_id, symbol, opened_candle_time, closed_candle_time)"))
+    conn.execute(text(
+        "CREATE INDEX IF NOT EXISTS ix_shadow_trade_model_closed "
+        "ON shadow_trades (model, closed_candle_time)"))
+    for tabela in ("shadow_opportunities", "shadow_positions", "shadow_trades"):
+        conn.execute(text(
+            f"CREATE INDEX IF NOT EXISTS ix_{tabela}_experiment "
+            f"ON {tabela} (experiment_id)"))
+
+
+def _v9_invariants_satisfied(conn: Connection) -> bool:
+    """As tres tabelas shadow existem E carregam suas chaves unicas -- sem
+    elas o reprocessamento duplicaria registro, que e' exatamente o que a
+    idempotencia do shadow promete."""
+    if not all(_table_exists(conn, t) for t in
+               ("shadow_experiments", "shadow_opportunities",
+                "shadow_positions", "shadow_trades")):
+        return False
+    # A identidade do experimento precisa existir em toda linha shadow --
+    # sem ela, metricas de configuracoes diferentes poderiam se misturar.
+    if not all(_column_exists(conn, t, "experiment_id") for t in
+               ("shadow_opportunities", "shadow_positions", "shadow_trades")):
+        return False
+    # Exatamente UM experimento ativo por modelo, garantido pelo banco.
+    if not _has_unique_partial_index_on(conn, "shadow_experiments", {"model"}):
+        return False
+    if not _has_unique_index_on(conn, "shadow_experiments", {"experiment_uid"}):
+        return False
+    # Idempotencia por EXPERIMENTO, nao por modelo.
+    if not _has_unique_index_on(conn, "shadow_opportunities",
+                                {"experiment_id", "symbol", "source_candle_open_time"}):
+        return False
+    if not _has_unique_index_on(conn, "shadow_positions",
+                                {"experiment_id", "symbol", "opened_candle_time"}):
+        return False
+    if not _has_unique_index_on(conn, "shadow_trades",
+                                {"experiment_id", "symbol", "opened_candle_time",
+                                 "closed_candle_time"}):
+        return False
+    # Verifica por COLUNAS, nunca por nome do indice. Um banco criado pela
+    # migration tem indices nomeados (CREATE UNIQUE INDEX); um criado por
+    # `Base.metadata.create_all` declara a mesma unicidade como CONSTRAINT
+    # DE TABELA, que o SQLite materializa num `sqlite_autoindex_*`. Os dois
+    # esquemas sao equivalentes e ambos precisam satisfazer o invariante --
+    # mesmo criterio que `_v2_invariants_satisfied` ja adota.
+    return True
+
+
 # Order matters: applied strictly in ascending version order.
 MIGRATIONS: list[tuple[int, str, Callable[[Connection], None]]] = [
     (1, "Adiciona system_state.state_ambiguous, orders.is_close; relaxa orders.stop_loss para opcional.", _migrate_to_v1),
@@ -609,6 +801,11 @@ MIGRATIONS: list[tuple[int, str, Callable[[Connection], None]]] = [
         "do candle.open_time que gerou o sinal, nunca derivada de preço/created_at, nunca retroativa em "
         "linhas legadas -- painel gráfico Fase 3.1.",
      _migrate_to_v8),
+    (9, "Fase 3.4.3: cria shadow_experiments, shadow_opportunities, shadow_positions e "
+        "shadow_trades -- "
+        "instrumentacao contrafactual isolada, puramente aditiva, sem FK para tabelas "
+        "operacionais e sem qualquer escrita retroativa.",
+     _migrate_to_v9),
 ]
 
 
@@ -728,6 +925,7 @@ _VERSION_INVARIANTS: dict[int, Callable[[Connection], bool]] = {
     6: _v6_invariants_satisfied,
     7: _v7_invariants_satisfied,
     8: _v8_invariants_satisfied,
+    9: _v9_invariants_satisfied,
 }
 
 

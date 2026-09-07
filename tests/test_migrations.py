@@ -193,7 +193,7 @@ def test_upgrade_v0_to_current_preserves_all_data_and_adds_new_schema(tmp_path):
 
     assert report.starting_version == 0
     assert report.ending_version == CURRENT_SCHEMA_VERSION
-    assert report.applied == [1, 2, 3, 4, 5, 6, 7, 8]
+    assert report.applied == [1, 2, 3, 4, 5, 6, 7, 8, 9]
     assert current_schema_version(engine) == CURRENT_SCHEMA_VERSION
 
     # 1. New columns exist.
@@ -342,7 +342,7 @@ def test_v1_database_only_needs_migration_2(tmp_path):
 
     report = run_migrations(engine)
     assert report.starting_version == 1
-    assert report.applied == [2, 3, 4, 5, 6, 7, 8]  # never re-runs migration 1's orders rebuild
+    assert report.applied == [2, 3, 4, 5, 6, 7, 8, 9]  # never re-runs migration 1's orders rebuild
 
     with engine.connect() as conn:
         cols = {r[1] for r in conn.execute(text("PRAGMA table_info(system_state)")).fetchall()}
@@ -505,7 +505,7 @@ def test_clock_out_of_sync_present_but_unique_index_missing_is_detected_as_v1(tm
     assert current_schema_version(engine) == 0  # stop_loss still NOT NULL -> v1 itself isn't satisfied either
 
     report = run_migrations(engine)
-    assert report.applied == [1, 2, 3, 4, 5, 6, 7, 8]
+    assert report.applied == [1, 2, 3, 4, 5, 6, 7, 8, 9]
     with engine.connect() as conn:
         assert conn.execute(
             text("SELECT name FROM sqlite_master WHERE type='index' AND name='uq_candle_symbol_timeframe_open_time'")
@@ -524,7 +524,7 @@ def test_is_close_present_but_stop_loss_still_not_null_is_detected_as_v0(tmp_pat
     assert current_schema_version(engine) == 0
 
     report = run_migrations(engine)
-    assert report.applied == [1, 2, 3, 4, 5, 6, 7, 8]
+    assert report.applied == [1, 2, 3, 4, 5, 6, 7, 8, 9]
     with engine.connect() as conn:
         assert conn.execute(text(
             "INSERT INTO orders (idempotency_key, risk_evaluation_id, symbol, side, qty, stop_loss, "
@@ -552,7 +552,7 @@ def test_recorded_v2_with_missing_index_raises_schema_divergence_error(tmp_path)
     # No further schema/data change happened as a side effect of detecting this.
     with engine.connect() as conn:
         migration_rows = conn.execute(text("SELECT version FROM schema_migrations ORDER BY version")).fetchall()
-        assert [r[0] for r in migration_rows] == [1, 2, 3, 4, 5, 6, 7, 8]  # unchanged from before the sabotage
+        assert [r[0] for r in migration_rows] == [1, 2, 3, 4, 5, 6, 7, 8, 9]  # unchanged from before the sabotage
 
 
 def test_differently_named_unique_index_still_satisfies_the_invariant(tmp_path):
@@ -584,7 +584,7 @@ def test_differently_named_unique_index_still_satisfies_the_invariant(tmp_path):
     assert current_schema_version(engine) == 2
 
     report = run_migrations(engine)
-    assert report.applied == [3, 4, 5, 6, 7, 8]  # already fully v2 (custom index name counts) -- only v3+ are new, no divergence
+    assert report.applied == [3, 4, 5, 6, 7, 8, 9]  # already fully v2 (custom index name counts) -- only v3+ are new, no divergence
 
 
 def test_fully_current_database_is_idempotent_under_strict_invariant_checking(tmp_path):
@@ -764,7 +764,7 @@ def test_partial_legacy_schema_with_no_history_migrates_and_validates_correctly(
 
     report = run_migrations(engine)
     assert report.starting_version == 0
-    assert report.applied == [1, 2, 3, 4, 5, 6, 7, 8]
+    assert report.applied == [1, 2, 3, 4, 5, 6, 7, 8, 9]
     assert current_schema_version(engine) == CURRENT_SCHEMA_VERSION
     with engine.connect() as conn:
         assert conn.execute(
@@ -896,7 +896,7 @@ def test_migration_v4_upgrades_a_real_v3_database_preserving_data_and_is_idempot
 
     report = run_migrations(engine)
     assert report.starting_version == 3
-    assert report.applied == [4, 5, 6, 7, 8]
+    assert report.applied == [4, 5, 6, 7, 8, 9]
     assert report.ending_version == CURRENT_SCHEMA_VERSION
     assert current_schema_version(engine) == CURRENT_SCHEMA_VERSION
 
@@ -1014,7 +1014,7 @@ def test_migration_v5_upgrades_a_real_v4_database_preserving_data_and_is_idempot
 
     report = run_migrations(engine)
     assert report.starting_version == 4
-    assert report.applied == [5, 6, 7, 8]
+    assert report.applied == [5, 6, 7, 8, 9]
     assert report.ending_version == CURRENT_SCHEMA_VERSION
     assert current_schema_version(engine) == CURRENT_SCHEMA_VERSION
 
@@ -1145,7 +1145,7 @@ def test_migration_v6_upgrades_a_real_v5_database_preserving_orders_fills_and_fu
 
     report = run_migrations(engine)
     assert report.starting_version == 5
-    assert report.applied == [6, 7, 8]
+    assert report.applied == [6, 7, 8, 9]
     assert report.ending_version == CURRENT_SCHEMA_VERSION
     assert current_schema_version(engine) == CURRENT_SCHEMA_VERSION
 
@@ -1266,7 +1266,7 @@ def test_migration_v7_upgrades_a_real_v6_database_preserving_data_and_is_idempot
 
     report = run_migrations(engine)
     assert report.starting_version == 6
-    assert report.applied == [7, 8]
+    assert report.applied == [7, 8, 9]
     assert report.ending_version == CURRENT_SCHEMA_VERSION
     assert current_schema_version(engine) == CURRENT_SCHEMA_VERSION
 
@@ -1412,7 +1412,7 @@ def test_migration_v8_upgrades_a_real_v7_database_preserving_data_and_is_idempot
 
     report = run_migrations(engine)
     assert report.starting_version == 7
-    assert report.applied == [8]
+    assert report.applied == [8, 9]
     assert report.ending_version == CURRENT_SCHEMA_VERSION
     assert current_schema_version(engine) == CURRENT_SCHEMA_VERSION
 

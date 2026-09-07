@@ -12,7 +12,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from app.ai_shadow.agent import AIShadowAgent, SimulatedProvider
-from app.api import routes_control, routes_dashboard
+from app.api import routes_control, routes_shadow, routes_dashboard
 from app.api.poll_engine import PollHealth, supervise_poll_loop, wait_for_in_flight_tick_before_shutdown
 from app.core.clock import ReplayClockProvider
 from app.core.config import RunMode, get_settings
@@ -32,6 +32,7 @@ from app.risk.cost_model import (
     CostModel,
 )
 from app.risk.engine import RiskEngine
+from app.shadow.engine import ShadowEngine, ShadowLimits
 from app.risk.config import RiskLimits
 from app.sessions import end_session, start_or_resume_session
 from app.strategy.engine import StrategyConfig, StrategyEngine
@@ -378,6 +379,29 @@ def build_orchestrator(settings, bybit_transport=None) -> Orchestrator | MultiSy
     # `execution_engine`, `ai_agent`, `price_state` and the same
     # `strategy_config` (values only -- each engine's rolling-window STATE
     # stays fully independent) with every other symbol.
+    # Fase 3.4.3: UM motor shadow por instancia, compartilhado entre os
+    # simbolos -- exatamente como execution_engine e risk_engine. Precisa ser
+    # unico porque os portfolios contrafactuais tem exposicao GLOBAL, igual a
+    # operacao. Nao tem, e nao pode ter, qualquer poder de gerar ordem.
+    shadow_engine = ShadowEngine(
+        limits=ShadowLimits(
+            max_position_usd=settings.risk_max_position_usd,
+            max_total_exposure_usd=settings.risk_max_total_exposure_usd,
+            min_order_notional_usd=settings.risk_min_order_notional_usd,
+            max_daily_loss_usd=settings.risk_max_daily_loss_usd,
+            cooldown_after_losses=settings.risk_cooldown_after_losses,
+            cooldown_minutes=settings.risk_cooldown_minutes,
+            fee_rate=getattr(execution_engine, "fee_rate", settings.paper_live_fee_rate),
+            slippage_bps=getattr(execution_engine, "slippage_bps", settings.paper_live_slippage_bps),
+            stop_loss_atr_multiple=settings.strategy_stop_loss_atr_multiple,
+            take_profit_atr_multiple=settings.strategy_take_profit_atr_multiple,
+            minimum_cost_coverage_ratio=settings.minimum_cost_coverage_ratio,
+            expected_move_atr_multiple=settings.strategy_expected_move_atr_multiple,
+        ),
+        strategy_timeframe_minutes=settings.strategy_timeframe_minutes,
+        strategy_config=strategy_config,
+    )
+
     orchestrators: dict[str, Orchestrator] = {}
     for symbol in settings.symbols:
         per_symbol_settings = settings.model_copy(update={"symbol": symbol, "symbols": [symbol]})
@@ -394,6 +418,7 @@ def build_orchestrator(settings, bybit_transport=None) -> Orchestrator | MultiSy
             price_state=price_state,
             funding_provider=funding_provider,
             visual_price_state=visual_price_state,
+            shadow_engine=shadow_engine,
         )
 
     orchestrator: Orchestrator | MultiSymbolOrchestrator
@@ -530,6 +555,7 @@ def create_app() -> FastAPI:
 
     app.include_router(routes_dashboard.router, prefix="/api")
     app.include_router(routes_control.router, prefix="/api")
+    app.include_router(routes_shadow.router, prefix="/api")
 
     @app.get("/")
     def index():
