@@ -93,7 +93,7 @@ from sqlalchemy.engine import Connection, Engine
 
 from app.persistence.models import Base
 
-CURRENT_SCHEMA_VERSION = 9
+CURRENT_SCHEMA_VERSION = 10
 
 
 class MigrationError(Exception):
@@ -158,6 +158,20 @@ def _has_unique_index_on(conn: Connection, table: str, columns: set[str]) -> boo
             continue
         index_info = conn.execute(text(f"PRAGMA index_info({index_name})")).fetchall()
         indexed_columns = {r[2] for r in index_info}  # (seqno, cid, name)
+        if indexed_columns == columns:
+            return True
+    return False
+
+
+def _has_index_on(conn: Connection, table: str, columns: set[str]) -> bool:
+    """Como `_has_unique_index_on`, mas aceita QUALQUER índice (único ou
+    não) cobrindo exatamente `columns`. Usado pela v10, cujos índices de
+    desempenho não precisam (e não devem) ser únicos."""
+    index_list = conn.execute(text(f"PRAGMA index_list({table})")).fetchall()
+    for index_row in index_list:
+        index_name = index_row[1]
+        index_info = conn.execute(text(f"PRAGMA index_info({index_name})")).fetchall()
+        indexed_columns = {r[2] for r in index_info}
         if indexed_columns == columns:
             return True
     return False
@@ -735,6 +749,32 @@ def _migrate_to_v9(conn: Connection) -> None:
             f"ON {tabela} (experiment_id)"))
 
 
+def _migrate_to_v10(conn: Connection) -> None:
+    """Fase 3.5 (auditoria do painel de diagnóstico): dois índices de
+    DESEMPENHO, medidos antes de criar (nunca especulativos):
+
+    - `EXPLAIN QUERY PLAN` sobre as consultas do endpoint consolidado
+      `/api/diagnostics/dashboard` mostrou `SCAN strategy_signals` (full
+      table scan) tanto no agrupamento por direção do funil quanto na
+      subconsulta de sinais acionáveis usada pelo gate de custos -- e esse
+      scan CRESCE com o volume de sinais, que só aumenta enquanto a V2
+      roda. Sem índice, o benchmark de 30 atualizações sequenciais deu
+      p95 = 342,8 ms, acima do critério de 250 ms.
+    - `risk_evaluations.signal_id` também aparecia como `SCAN` na
+      subconsulta que junta avaliação de risco ao sinal.
+
+    Puramente aditivo: dois `CREATE INDEX IF NOT EXISTS` sobre tabelas
+    operacionais já existentes, nenhuma coluna nova, nenhuma tabela nova,
+    nenhuma reescrita de dado. `journal_mode` permanece `delete` -- não
+    alterado nesta fase."""
+    conn.execute(text(
+        "CREATE INDEX IF NOT EXISTS ix_strategy_signals_created_at "
+        "ON strategy_signals (created_at)"))
+    conn.execute(text(
+        "CREATE INDEX IF NOT EXISTS ix_risk_evaluations_signal_id "
+        "ON risk_evaluations (signal_id)"))
+
+
 def _v9_invariants_satisfied(conn: Connection) -> bool:
     """As tres tabelas shadow existem E carregam suas chaves unicas -- sem
     elas o reprocessamento duplicaria registro, que e' exatamente o que a
@@ -806,6 +846,11 @@ MIGRATIONS: list[tuple[int, str, Callable[[Connection], None]]] = [
         "instrumentacao contrafactual isolada, puramente aditiva, sem FK para tabelas "
         "operacionais e sem qualquer escrita retroativa.",
      _migrate_to_v9),
+    (10, "Fase 3.5: índices de desempenho medidos (EXPLAIN QUERY PLAN + benchmark) em "
+         "strategy_signals.created_at e risk_evaluations.signal_id -- eliminam full table scan "
+         "crescente nas consultas de janela temporal do painel de diagnóstico. Puramente "
+         "aditivo, journal_mode inalterado.",
+     _migrate_to_v10),
 ]
 
 
@@ -916,6 +961,18 @@ def _v8_invariants_satisfied(conn: Connection) -> bool:
     )
 
 
+def _v10_invariants_satisfied(conn: Connection) -> bool:
+    """Os dois índices de desempenho existem, por COLUNAS (nunca por nome)
+    -- um banco criado por `create_all` declara o mesmo índice via
+    `index=True` no modelo, com nome gerado pelo SQLAlchemy, não pelo
+    literal desta migration; os dois esquemas precisam satisfazer o mesmo
+    invariante."""
+    return (
+        _has_index_on(conn, "strategy_signals", {"created_at"})
+        and _has_index_on(conn, "risk_evaluations", {"signal_id"})
+    )
+
+
 _VERSION_INVARIANTS: dict[int, Callable[[Connection], bool]] = {
     1: _v1_invariants_satisfied,
     2: _v2_invariants_satisfied,
@@ -926,6 +983,7 @@ _VERSION_INVARIANTS: dict[int, Callable[[Connection], bool]] = {
     7: _v7_invariants_satisfied,
     8: _v8_invariants_satisfied,
     9: _v9_invariants_satisfied,
+    10: _v10_invariants_satisfied,
 }
 
 

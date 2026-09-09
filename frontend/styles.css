@@ -82,6 +82,9 @@ body {
 .btn-danger { background: var(--red); color: #2a0a0a; }
 .btn-secondary { background: var(--border); color: var(--text); }
 
+.topbar-nav { display: flex; align-items: center; }
+a.btn-secondary { display: inline-block; text-decoration: none; }
+
 main { padding: 20px; max-width: 1200px; margin: 0 auto; }
 
 .grid {

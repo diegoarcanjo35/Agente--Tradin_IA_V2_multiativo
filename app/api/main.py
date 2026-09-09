@@ -12,7 +12,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from app.ai_shadow.agent import AIShadowAgent, SimulatedProvider
-from app.api import routes_control, routes_shadow, routes_dashboard
+from app.api import routes_control, routes_diagnostics, routes_shadow, routes_dashboard
 from app.api.poll_engine import PollHealth, supervise_poll_loop, wait_for_in_flight_tick_before_shutdown
 from app.core.clock import ReplayClockProvider
 from app.core.config import RunMode, get_settings
@@ -556,6 +556,7 @@ def create_app() -> FastAPI:
     app.include_router(routes_dashboard.router, prefix="/api")
     app.include_router(routes_control.router, prefix="/api")
     app.include_router(routes_shadow.router, prefix="/api")
+    app.include_router(routes_diagnostics.router, prefix="/api")
 
     @app.get("/")
     def index():

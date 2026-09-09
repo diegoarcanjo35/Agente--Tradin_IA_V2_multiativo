@@ -1,0 +1,743 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Estratégia & Shadow — Diagnóstico</title>
+<style>
+  :root {
+    --bg: #0f1420; --card: #171d2e; --border: #2a3348; --text: #e6e9f0;
+    --muted: #8a93a8; --green: #34d399; --red: #f87171; --yellow: #fbbf24;
+    --blue: #60a5fa; --purple: #c084fc; --bar-bg: #232b40;
+  }
+  * { box-sizing: border-box; }
+  html, body { max-width: 100%; overflow-x: hidden; }
+  body {
+    margin: 0; padding: 16px; background: var(--bg); color: var(--text);
+    font-family: -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+    font-size: 14px; line-height: 1.4;
+  }
+  h1 { font-size: 19px; margin: 0 0 2px; }
+  h2 { font-size: 15px; margin: 0 0 12px; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  h3 { font-size: 13px; margin: 0 0 6px; color: var(--muted); font-weight: 600; }
+  .sub { color: var(--muted); margin-bottom: 4px; font-size: 12.5px; }
+  .topbar { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; flex-wrap: wrap; margin-bottom: 10px; }
+  nav.crumbs { font-size: 12.5px; color: var(--muted); margin-bottom: 6px; }
+  nav.crumbs a { color: var(--blue); text-decoration: none; }
+  .topbar-actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  #refresh-btn, #scope-select {
+    background: var(--bar-bg); color: var(--text); border: 1px solid var(--border);
+    border-radius: 6px; padding: 6px 12px; font-size: 12.5px; cursor: pointer; white-space: nowrap;
+  }
+  #refresh-btn:hover { border-color: var(--blue); }
+  #custom-period-fields {
+    display: flex; gap: 6px; align-items: center; flex-wrap: wrap;
+  }
+  #custom-period-fields[hidden] { display: none; }
+  #custom-period-fields input[type="datetime-local"] {
+    background: var(--bar-bg); color: var(--text); border: 1px solid var(--border);
+    border-radius: 6px; padding: 5px 8px; font-size: 12px;
+  }
+  #custom-apply-btn {
+    background: var(--bar-bg); color: var(--text); border: 1px solid var(--border);
+    border-radius: 6px; padding: 5px 10px; font-size: 12px; cursor: pointer;
+  }
+  #custom-apply-btn:hover { border-color: var(--blue); }
+  #custom-period-error {
+    color: var(--red); font-size: 12px; margin-top: 4px;
+  }
+  .fuso-label { color: var(--muted); font-size: 11.5px; }
+  #stale-banner {
+    background: rgba(251,191,36,.12); border: 1px solid var(--yellow); color: var(--yellow);
+    border-radius: 8px; padding: 8px 12px; margin-bottom: 12px; font-size: 12.5px;
+  }
+  #window-banner { color: var(--muted); font-size: 12px; margin-bottom: 12px; }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin-bottom: 14px; }
+  .grid.g3 { grid-template-columns: 1fr 1fr 1fr; }
+  .grid.g4 { grid-template-columns: 1fr 1fr 1fr 1fr; }
+  @media (max-width: 860px) { .grid, .grid.g3, .grid.g4 { grid-template-columns: 1fr; } }
+  .card {
+    background: var(--card); border: 1px solid var(--border); border-radius: 10px;
+    padding: 14px 16px; min-width: 0;
+  }
+  .badge {
+    display: inline-block; padding: 2px 9px; border-radius: 999px; font-size: 11.5px; font-weight: 600;
+  }
+  .badge.ok { background: rgba(52,211,153,.15); color: var(--green); }
+  .badge.bad { background: rgba(248,113,113,.15); color: var(--red); }
+  .badge.warn { background: rgba(251,191,36,.15); color: var(--yellow); }
+  .badge.off { background: rgba(138,147,168,.15); color: var(--muted); }
+  .badge.info { background: rgba(96,165,250,.15); color: var(--blue); }
+  .camada-label {
+    font-size: 10.5px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted);
+    display: block; margin-bottom: 2px;
+  }
+  .camada-tecnica .camada-label { color: var(--blue); }
+  .camada-operacional .camada-label { color: var(--purple); }
+  .camada-economica .camada-label { color: var(--yellow); }
+  .camada-estatistica .camada-label { color: var(--muted); }
+  .kv { display: grid; grid-template-columns: auto 1fr; gap: 4px 12px; }
+  .kv .k { color: var(--muted); }
+  .kv .v { text-align: right; font-variant-numeric: tabular-nums; }
+  table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+  th, td { text-align: left; padding: 5px 7px; border-bottom: 1px solid var(--border); }
+  th { color: var(--muted); font-weight: 500; font-size: 11.5px; }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  .table-scroll { overflow-x: auto; max-width: 100%; }
+  .pnl-pos { color: var(--green); }
+  .pnl-neg { color: var(--red); }
+  .pnl-nd { color: var(--muted); }
+  .empty { color: var(--muted); font-style: italic; padding: 8px 0; }
+  .obrigatorio {
+    border: 1px solid var(--border); border-left: 3px solid var(--yellow);
+    background: rgba(251,191,36,.06); border-radius: 6px; padding: 8px 10px;
+    font-size: 12.5px; margin-top: 8px;
+  }
+  .funnel-row { display: grid; grid-template-columns: 190px 1fr 70px; gap: 8px; align-items: center; margin-bottom: 6px; }
+  .funnel-bar-bg { background: var(--bar-bg); border-radius: 5px; height: 18px; overflow: hidden; }
+  .funnel-bar-fill { background: var(--blue); height: 100%; border-radius: 5px 0 0 5px; }
+  .funnel-label { font-size: 12px; color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .funnel-n { font-size: 12px; text-align: right; font-variant-numeric: tabular-nums; color: var(--muted); }
+  .hist-row { display: grid; grid-template-columns: 90px 1fr 40px; gap: 8px; align-items: center; margin-bottom: 5px; font-size: 12px; }
+  .hist-bar-bg { background: var(--bar-bg); border-radius: 4px; height: 14px; overflow: hidden; }
+  .hist-bar-fill { background: var(--yellow); height: 100%; }
+  .hist-bar-fill.over { background: var(--green); }
+  .rej-row { display: grid; grid-template-columns: 180px 1fr 90px; gap: 8px; align-items: center; margin-bottom: 5px; font-size: 12px; }
+  .rej-bar-bg { background: var(--bar-bg); border-radius: 4px; height: 14px; overflow: hidden; }
+  .rej-bar-fill { background: var(--red); height: 100%; }
+  .rej-bar-fill.aprovado { background: var(--green); }
+  .model-tag { font-family: monospace; font-size: 11.5px; padding: 1px 6px; border-radius: 4px; white-space: nowrap; }
+  .model-tag.baseline { background: rgba(96,165,250,.15); color: var(--blue); }
+  .model-tag.h2 { background: rgba(251,191,36,.15); color: var(--yellow); }
+  .progress-track { background: var(--bar-bg); border-radius: 6px; height: 10px; overflow: hidden; margin: 4px 0 10px; }
+  .progress-fill { background: var(--blue); height: 100%; }
+  .progress-fill.done { background: var(--green); }
+  .milestone-label { display: flex; justify-content: space-between; font-size: 11.5px; color: var(--muted); }
+  .filters { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 10px; }
+  .filters select, .filters input {
+    background: var(--bar-bg); color: var(--text); border: 1px solid var(--border);
+    border-radius: 6px; padding: 5px 8px; font-size: 12px;
+  }
+  .tooltip { position: relative; cursor: help; border-bottom: 1px dotted var(--muted); }
+  .tooltip .bubble {
+    display: none; position: absolute; bottom: 130%; left: 0; z-index: 10;
+    background: #000; color: #fff; padding: 6px 9px; border-radius: 6px; font-size: 11.5px;
+    width: 220px; line-height: 1.35; box-shadow: 0 2px 8px rgba(0,0,0,.4);
+  }
+  .tooltip:hover .bubble { display: block; }
+  .warn-box {
+    background: rgba(251,191,36,.10); border: 1px solid rgba(251,191,36,.4);
+    border-radius: 8px; padding: 8px 10px; font-size: 12px; color: var(--yellow); margin-top: 8px;
+  }
+  .footer { color: var(--muted); font-size: 11.5px; margin-top: 20px; }
+</style>
+</head>
+<body>
+  <nav class="crumbs"><a href="/">Painel principal</a> &nbsp;/&nbsp; Estratégia &amp; Shadow</nav>
+  <div class="topbar">
+    <div>
+      <h1>Estratégia &amp; Shadow — Diagnóstico do Funil</h1>
+      <div class="sub" id="banner-shadow-mode"></div>
+    </div>
+    <div class="topbar-actions">
+      <select id="scope-select">
+        <option value="experiment">Experimento atual</option>
+        <option value="24h">Últimas 24 horas</option>
+        <option value="7d">Últimos 7 dias</option>
+        <option value="custom">Período personalizado</option>
+      </select>
+      <div id="custom-period-fields" hidden>
+        <input type="datetime-local" id="custom-since" step="60">
+        <span class="sub">até</span>
+        <input type="datetime-local" id="custom-until" step="60">
+        <button id="custom-apply-btn" type="button">Aplicar</button>
+        <span class="fuso-label" id="fuso-label-custom"></span>
+      </div>
+      <button id="refresh-btn" type="button">Atualizar agora</button>
+    </div>
+  </div>
+  <div id="custom-period-error" hidden></div>
+  <div id="window-banner"></div>
+  <div id="stale-banner" hidden></div>
+
+  <!-- SEÇÃO 1: status executivo -->
+  <div class="grid g4" id="secao-1"></div>
+
+  <!-- SEÇÃO 2 -->
+  <div class="card" style="margin-bottom:14px">
+    <h2>Funil de decisão <span class="badge off">onde o fluxo para</span></h2>
+    <div id="funil-container"></div>
+  </div>
+
+  <!-- SEÇÃO 3 -->
+  <div class="grid" id="secao-3"></div>
+
+  <!-- SEÇÃO 4 -->
+  <div class="card" style="margin-bottom:14px">
+    <h2>Cobertura de custos <span class="badge off">limiar operacional 3,0×</span></h2>
+    <div id="cobertura-container"></div>
+  </div>
+
+  <!-- SEÇÃO 5 -->
+  <div class="card" style="margin-bottom:14px">
+    <h2>Motivos de rejeição</h2>
+    <div class="filters">
+      <select id="f-model"><option value="">todos os modelos</option></select>
+      <select id="f-symbol"><option value="">todos os símbolos</option></select>
+      <select id="f-direction"><option value="">todas as direções</option></select>
+    </div>
+    <div id="rejeicoes-container"></div>
+  </div>
+
+  <!-- SEÇÃO 6 -->
+  <div class="card" style="margin-bottom:14px">
+    <h2>Qualidade das entradas <span class="tooltip">(MFE/MAE)<span class="bubble">MFE: máxima excursão favorável — o quanto o preço chegou a andar a favor da posição antes do fechamento. MAE: máxima excursão adversa — o quanto andou contra.</span></span></h2>
+    <div id="qualidade-container"></div>
+  </div>
+
+  <!-- SEÇÃO 7 -->
+  <div class="grid" id="secao-7"></div>
+
+  <!-- SEÇÃO 8 -->
+  <div class="card" style="margin-bottom:14px">
+    <h2>Eventos recentes</h2>
+    <div id="eventos-container"></div>
+  </div>
+
+  <div class="footer">
+    Página local, somente leitura. Nunca soma dados shadow ao patrimônio operacional. Fonte: esta mesma instância, via /api/diagnostics/dashboard (uma única requisição por ciclo). Polling a cada 30s, pausado quando a aba está oculta.
+  </div>
+
+<script>
+'use strict';
+const API = "";
+const POLL_MS = 30000;
+
+// ---------------------------------------------------------------- utils
+function fmt(n, casas) {
+  casas = casas === undefined ? 2 : casas;
+  if (n === null || n === undefined || Number.isNaN(n)) return "N/D";
+  return Number(n).toLocaleString("pt-BR", {minimumFractionDigits: casas, maximumFractionDigits: casas});
+}
+function fmtPct(n, casas) {
+  if (n === null || n === undefined || Number.isNaN(n)) return "N/D";
+  return fmt(n * 100, casas === undefined ? 1 : casas) + "%";
+}
+// Fuso do NAVEGADOR, calculado uma unica vez -- todo timestamp exibido
+// no painel (fmtData) usa exatamente este deslocamento, e SO' este; a
+// API sempre devolve ISO-8601 com offset explicito (ex.: "+00:00" UTC),
+// entao `new Date(iso)` interpreta o offset de origem uma unica vez e
+// `toLocaleString` converte para o fuso do navegador uma unica vez --
+// nunca duas conversoes empilhadas.
+function rotuloFuso() {
+  const offsetMin = -new Date().getTimezoneOffset();
+  const sinal = offsetMin >= 0 ? "+" : "-";
+  const abs = Math.abs(offsetMin);
+  const horas = String(Math.floor(abs / 60)).padStart(2, "0");
+  return "UTC" + sinal + horas;
+}
+const FUSO_LABEL = rotuloFuso();
+
+function fmtData(iso) {
+  if (!iso) return "N/D";
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return "N/D";
+  return d.toLocaleString("pt-BR", {hour12:false}) + " (" + FUSO_LABEL + ")";
+}
+function pnlClass(v) {
+  if (v === null || v === undefined) return "pnl-nd";
+  return v >= 0 ? "pnl-pos" : "pnl-neg";
+}
+// Cor derivada SEMPRE de `classificacao_resultado` (backend), nunca do
+// sinal aritmético isolado -- com zero trades o resultado e' "sem_dados"
+// (NEUTRO), nunca verde nem vermelho; bruto positivo com líquido negativo
+// nunca vira verde.
+function classeResultado(d) {
+  if (!d || d.classificacao_resultado === "sem_dados") return "pnl-nd";
+  if (d.classificacao_resultado === "liquido_positivo") return "pnl-pos";
+  return "pnl-neg";
+}
+// Construtores DOM seguros -- NUNCA innerHTML, nem com literal fixa.
+function el(tag, attrs, children) {
+  const n = document.createElement(tag);
+  if (attrs) for (const [k, v] of Object.entries(attrs)) {
+    if (k === "class") n.className = v;
+    else if (k.startsWith("on")) n.addEventListener(k.slice(2), v);
+    else n.setAttribute(k, v);
+  }
+  (children || []).forEach(c => n.appendChild(typeof c === "string" ? document.createTextNode(c) : c));
+  return n;
+}
+function clear(node) { while (node.firstChild) node.removeChild(node.firstChild); }
+function badge(texto, classe) { return el("span", {class: "badge " + classe}, [texto]); }
+function td(texto, classe) { return el("td", classe ? {class: classe} : null, [String(texto)]); }
+
+// ---------------------------------------------------------------- fetch com timeout/abort/backoff
+let backoffMs = 0;
+
+async function getJSON(rota, params) {
+  let url = API + rota;
+  if (params) {
+    const qs = new URLSearchParams(Object.entries(params).filter(([, v]) => v !== "" && v != null));
+    if ([...qs].length) url += "?" + qs.toString();
+  }
+  const ctrl = new AbortController();
+  const timeoutId = setTimeout(() => ctrl.abort(), 12000);
+  try {
+    const r = await fetch(url, {cache: "no-store", signal: ctrl.signal});
+    if (!r.ok) throw new Error(url + " -> HTTP " + r.status);
+    return await r.json();
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
+// ---------------------------------------------------------------- render: SECAO 1 (executivo)
+function renderStatusExecutivo(d) {
+  const box = document.getElementById("secao-1");
+  clear(box);
+  document.getElementById("banner-shadow-mode").textContent =
+    "SHADOW — NÃO EXECUTA ORDENS. Observação pura, patrimônio nunca compartilhado com a operação real.";
+  document.getElementById("window-banner").textContent =
+    "Janela: " + d.window.rotulo + " (" + fmtData(d.window.desde) + " → " + fmtData(d.window.ate) +
+    ") | gerado às " + fmtData(d.generated_at);
+
+  const state = d.operational, shadowHealth = d.shadow_health;
+  const comp = d.comparison, cg = d.cost_gate, funnel = d.funnel, sig = d.significance;
+  const baseline = comp.baseline_without_cost_gate, h2 = comp.h2_ma_separation_015;
+
+  // --- CAMADA 1: funcionamento TÉCNICO ---
+  const c1 = el("div", {class: "card camada-tecnica"});
+  c1.appendChild(el("span", {class: "camada-label"}, ["Funcionamento técnico"]));
+  const h1_ = el("h2", null, ["Saúde"]);
+  const shadowOk = shadowHealth && shadowHealth.enabled && shadowHealth.status === "SAUDAVEL";
+  h1_.appendChild(badge(shadowOk ? "SHADOW SAUDÁVEL" : "SHADOW " + (shadowHealth ? shadowHealth.status : "N/D"),
+                       shadowOk ? "ok" : "bad"));
+  c1.appendChild(h1_);
+  const kv1 = el("div", {class: "kv"});
+  [["Operação", state ? state.operational_state : "N/D"],
+   ["Saúde de mercado", state && state.symbols_health ? state.symbols_health.portfolio.healthy_count + "/" + state.symbols_health.portfolio.total : "N/D"],
+   ["Falhas shadow (cum.)", shadowHealth ? shadowHealth.failures : "N/D"],
+   ["Bloqueia operação?", shadowHealth && shadowHealth.blocks_operation ? "SIM ⚠" : "não"]]
+   .forEach(([k, v]) => { kv1.appendChild(el("div", {class: "k"}, [k])); kv1.appendChild(el("div", {class: "v"}, [String(v)])); });
+  c1.appendChild(kv1);
+  box.appendChild(c1);
+
+  // --- CAMADA 2: restrição OPERACIONAL (por que zero ordens) ---
+  const c2 = el("div", {class: "card camada-operacional"});
+  c2.appendChild(el("span", {class: "camada-label"}, ["Restrição operacional"]));
+  c2.appendChild(el("h2", null, ["Por que zero ordens"]));
+  const sinaisRisk = funnel.etapas.find(e => e.etapa === "avaliados_risk_engine");
+  const kv2 = el("div", {class: "kv"});
+  [["Sinais ao RiskEngine", sinaisRisk ? sinaisRisk.total : "N/D"],
+   ["Maior cobertura observada", cg.maximo !== undefined ? fmt(cg.maximo, 3) + "×" : "N/D"],
+   ["Limiar exigido", cg.limiar_operacional !== undefined ? fmt(cg.limiar_operacional, 1) + "×" : "N/D"],
+   ["Passaram no gate real", "0"]]
+   .forEach(([k, v]) => { kv2.appendChild(el("div", {class: "k"}, [k])); kv2.appendChild(el("div", {class: "v"}, [String(v)])); });
+  c2.appendChild(kv2);
+  c2.appendChild(el("div", {class: "obrigatorio"}, [d.economic_verdict.zero_ordens.classificacao]));
+  box.appendChild(c2);
+
+  // --- CAMADA 3: desempenho ECONÔMICO ---
+  const c3 = el("div", {class: "card camada-economica"});
+  c3.appendChild(el("span", {class: "camada-label"}, ["Desempenho econômico"]));
+  c3.appendChild(el("h2", null, ["Resultado líquido"]));
+  const kv3 = el("div", {class: "kv"});
+  const linhaBase = el("div", {class: "k"}, ["Baseline"]);
+  // Correção da auditoria: a cor segue SEMPRE `classificacao_resultado`
+  // (nunca o sinal aritmético isolado) -- bruto positivo com líquido
+  // negativo nunca fica verde, e zero trades (sem_dados) fica NEUTRO,
+  // nunca verde nem vermelho.
+  const valBase = el("div", {class: "v " + classeResultado(baseline)}, ["US$ " + fmt(baseline.net_pnl_usd, 4)]);
+  const linhaH2 = el("div", {class: "k"}, ["H2"]);
+  const valH2 = el("div", {class: "v " + classeResultado(h2)}, ["US$ " + fmt(h2.net_pnl_usd, 4)]);
+  kv3.appendChild(linhaBase); kv3.appendChild(valBase);
+  kv3.appendChild(linhaH2); kv3.appendChild(valH2);
+  c3.appendChild(kv3);
+  if (h2.classificacao_resultado === "bruto_positivo_liquido_negativo") {
+    c3.appendChild(el("div", {class: "obrigatorio"}, [
+      "H2: bruto positivo (US$ " + fmt(h2.gross_pnl_usd, 4) + ") mas líquido negativo -- os custos de " +
+      "transação superaram o resultado observado. Isso NÃO é exibido como resultado favorável."]));
+  }
+  box.appendChild(c3);
+
+  // --- CAMADA 4: força ESTATÍSTICA ---
+  const c4 = el("div", {class: "card camada-estatistica"});
+  c4.appendChild(el("span", {class: "camada-label"}, ["Força estatística"]));
+  c4.appendChild(el("h2", null, ["Amostra", badge("INCONCLUSIVA", "warn")]));
+  const sigH2 = sig.h2_ma_separation_015, sigBase = sig.baseline_without_cost_gate;
+  const kv4 = el("div", {class: "kv"});
+  [["Trades baseline", sigBase.n_trades], ["Trades H2", sigH2.n_trades],
+   ["Amostra suficiente (H2 ≥ 60)?", sigH2.amostra_suficiente_para_conclusao_formal ? "sim" : "não"]]
+   .forEach(([k, v]) => { kv4.appendChild(el("div", {class: "k"}, [k])); kv4.appendChild(el("div", {class: "v"}, [String(v)])); });
+  c4.appendChild(kv4);
+  c4.appendChild(el("div", {class: "obrigatorio"}, [d.economic_verdict.h2_texto_obrigatorio]));
+  box.appendChild(c4);
+}
+
+// ---------------------------------------------------------------- render: SECAO 2 (funil)
+function renderFunil(funnel) {
+  const box = document.getElementById("funil-container");
+  clear(box);
+  if (!funnel || !funnel.etapas) { box.appendChild(el("div", {class: "empty"}, ["sem dados"])); return; }
+  const etapas = funnel.etapas;
+  const maxN = Math.max(...etapas.map(e => e.total || 0), 1);
+  const nomes = {
+    candles_1m: "Candles de 1 min", buckets_15m_fechados: "Buckets de 15 min",
+    sinais_gerados: "Sinais gerados", sinais_acionaveis: "Sinais acionáveis (BUY/SELL)",
+    avaliados_risk_engine: "Avaliados pelo RiskEngine", aprovados_gate_operacional_real: "Aprovados pelo gate real",
+    ordens_criadas: "Ordens criadas", fills: "Fills", posicoes_operacionais: "Posições operacionais",
+  };
+  etapas.forEach(e => {
+    const row = el("div", {class: "funnel-row"});
+    row.appendChild(el("div", {class: "funnel-label"}, [nomes[e.etapa] || e.etapa]));
+    const barBg = el("div", {class: "funnel-bar-bg"});
+    const largura = Math.max(2, (e.total || 0) / maxN * 100);
+    barBg.appendChild(el("div", {class: "funnel-bar-fill", style: "width:" + largura + "%"}));
+    row.appendChild(barBg);
+    let rotulo = String(e.total ?? 0);
+    if (e.taxa_do_anterior !== null && e.taxa_do_anterior !== undefined) rotulo += " (" + fmtPct(e.taxa_do_anterior, 1) + ")";
+    row.appendChild(el("div", {class: "funnel-n"}, [rotulo]));
+    box.appendChild(row);
+  });
+  if (funnel.nota) box.appendChild(el("div", {class: "warn-box"}, [funnel.nota]));
+}
+
+// ---------------------------------------------------------------- render: SECAO 3 (comparacao)
+function renderComparacao(comparison) {
+  const box = document.getElementById("secao-3");
+  clear(box);
+  if (!comparison) { box.appendChild(el("div", {class: "empty"}, ["sem dados"])); return; }
+  const nomes = {baseline_without_cost_gate: "Baseline (sem portão de custo)", h2_ma_separation_015: "H2 (separação ≥ 0,15)"};
+  for (const [chave, d] of Object.entries(comparison)) {
+    const card = el("div", {class: "card"});
+    const h = el("h2", null, [nomes[chave] || chave]);
+    if (d.classificacao_resultado === "liquido_positivo") h.appendChild(badge("líquido positivo", "ok"));
+    else if (d.classificacao_resultado === "bruto_positivo_liquido_negativo") h.appendChild(badge("bruto+ / líquido−", "warn"));
+    else if (d.classificacao_resultado === "liquido_negativo") h.appendChild(badge("líquido negativo", "bad"));
+    card.appendChild(h);
+    const kv = el("div", {class: "kv"});
+    const linhas = [
+      ["Trades fechados", d.closed_trades],
+      ["Taxa de acerto", d.win_rate !== null ? fmtPct(d.win_rate, 1) : "N/D"],
+      ["P&L bruto", "US$ " + fmt(d.gross_pnl_usd, 4)],
+      ["Taxas", "US$ " + fmt(-(d.fees_usd || 0), 4)],
+      ["Slippage", "US$ " + fmt(-(d.slippage_usd || 0), 4)],
+      ["P&L líquido", "US$ " + fmt(d.net_pnl_usd, 4)],
+      ["Payoff", d.payoff !== null ? fmt(d.payoff, 3) : "N/D"],
+      ["Profit factor", d.profit_factor !== null ? fmt(d.profit_factor, 3) : "N/D"],
+      ["Expectativa/trade", "US$ " + fmt(d.expectancy_usd, 4)],
+      ["Drawdown", "US$ " + fmt(d.drawdown_usd, 4)],
+      ["Sequência máx. de perdas", d.max_losing_streak],
+      ["Duração média", d.avg_duration_minutes !== null ? fmt(d.avg_duration_minutes, 0) + " min" : "N/D"],
+    ];
+    linhas.forEach(([k, v]) => {
+      kv.appendChild(el("div", {class: "k"}, [k]));
+      const vEl = el("div", {class: "v"});
+      if (k === "P&L líquido") vEl.className += " " + classeResultado(d);
+      vEl.appendChild(document.createTextNode(String(v)));
+      kv.appendChild(vEl);
+    });
+    card.appendChild(kv);
+    if (d.current_position) {
+      const p = d.current_position;
+      card.appendChild(el("h3", {style: "margin-top:10px"}, ["Posição atual"]));
+      const kv2 = el("div", {class: "kv"});
+      [["Símbolo", p.symbol], ["Lado", p.side], ["Entrada", fmt(p.entry_fill_price)],
+       ["Stop", fmt(p.stop_loss)], ["Alvo", fmt(p.take_profit)],
+       ["MFE até agora", p.mfe_pct_ate_agora !== null && p.mfe_pct_ate_agora !== undefined ? fmt(p.mfe_pct_ate_agora, 3) + "%" : "N/D"],
+       ["MAE até agora", p.mae_pct_ate_agora !== null && p.mae_pct_ate_agora !== undefined ? fmt(p.mae_pct_ate_agora, 3) + "%" : "N/D"]]
+       .forEach(([k, v]) => {
+        kv2.appendChild(el("div", {class: "k"}, [k])); kv2.appendChild(el("div", {class: "v"}, [String(v)]));
+      });
+      card.appendChild(kv2);
+    } else {
+      card.appendChild(el("div", {class: "sub", style: "margin-top:8px"}, ["nenhuma posição shadow aberta agora"]));
+    }
+    box.appendChild(card);
+  }
+}
+
+// ---------------------------------------------------------------- render: SECAO 4 (cobertura)
+function renderCobertura(cg) {
+  const box = document.getElementById("cobertura-container");
+  clear(box);
+  if (!cg || !cg.n) { box.appendChild(el("div", {class: "empty"}, ["sem avaliações de risco na janela"])); return; }
+  const kv = el("div", {class: "kv", style: "margin-bottom:10px"});
+  [["n", cg.n], ["mínimo", fmt(cg.minimo, 3) + "×"], ["mediana", fmt(cg.mediana, 3) + "×"],
+   ["máximo", fmt(cg.maximo, 3) + "×"], ["p90", fmt(cg.p90, 3) + "×"], ["p95", fmt(cg.p95, 3) + "×"],
+   ["limiar operacional", fmt(cg.limiar_operacional, 1) + "×"]].forEach(([k, v]) => {
+    kv.appendChild(el("div", {class: "k"}, [k])); kv.appendChild(el("div", {class: "v"}, [String(v)]));
+  });
+  box.appendChild(kv);
+
+  const faixas = [["abaixo_1_0x", "< 1,0×"], ["1_0_a_1_5x", "1,0–1,5×"], ["1_5_a_2_0x", "1,5–2,0×"],
+                  ["2_0_a_3_0x", "2,0–3,0×"], ["acima_3_0x", "≥ 3,0×"]];
+  const maxN = Math.max(...Object.values(cg.distribuicao_por_faixa), 1);
+  faixas.forEach(([chave, rotulo]) => {
+    const n = cg.distribuicao_por_faixa[chave] || 0;
+    const row = el("div", {class: "hist-row"});
+    row.appendChild(el("div", null, [rotulo]));
+    const barBg = el("div", {class: "hist-bar-bg"});
+    barBg.appendChild(el("div", {class: "hist-bar-fill" + (chave === "acima_3_0x" ? " over" : ""),
+                               style: "width:" + Math.max(2, n / maxN * 100) + "%"}));
+    row.appendChild(barBg);
+    row.appendChild(el("div", null, [String(n)]));
+    box.appendChild(row);
+  });
+  box.appendChild(el("div", {class: "warn-box"}, [cg.nota]));
+}
+
+// ---------------------------------------------------------------- render: SECAO 5 (rejeicoes)
+const NOMES_CATEGORIA = {
+  aprovado: "Aprovado", separacao_h2_insuficiente: "Separação H2 insuficiente",
+  exposicao_esgotada: "Exposição esgotada", cooldown: "Cooldown ativo",
+  notional_minimo: "Notional abaixo do mínimo", sinal_oposto: "Sinal oposto (fechou posição)",
+  saida_mesmo_tick: "Saída no mesmo tick", limite_perda_diaria: "Limite de perda diária",
+  posicao_ja_aberta: "Posição já aberta", outro: "Outro",
+};
+function renderRejeicoes(r) {
+  const box = document.getElementById("rejeicoes-container");
+  clear(box);
+  if (!r || !r.total) { box.appendChild(el("div", {class: "empty"}, ["sem oportunidades no filtro/janela atual"])); return; }
+  r.ranking.forEach(item => {
+    const row = el("div", {class: "rej-row"});
+    row.appendChild(el("div", null, [NOMES_CATEGORIA[item.categoria] || item.categoria]));
+    const barBg = el("div", {class: "rej-bar-bg"});
+    barBg.appendChild(el("div", {class: "rej-bar-fill" + (item.categoria === "aprovado" ? " aprovado" : ""),
+                               style: "width:" + Math.max(2, item.percentual) + "%"}));
+    row.appendChild(barBg);
+    row.appendChild(el("div", null, [item.quantidade + " (" + fmt(item.percentual, 1) + "%)"]));
+    box.appendChild(row);
+  });
+}
+
+// ---------------------------------------------------------------- render: SECAO 6 (qualidade)
+function renderQualidade(tq) {
+  const box = document.getElementById("qualidade-container");
+  clear(box);
+  if (!tq || !tq.trades.length) { box.appendChild(el("div", {class: "empty"}, ["nenhum trade fechado ainda"])); return; }
+  const wrap = el("div", {class: "table-scroll"});
+  const table = el("table");
+  const head = el("tr", null, ["Símbolo","Direção","Modelo","Duração","Saída","Separação","MFE","MAE","Resultado"].map(t => el("th", null, [t])));
+  table.appendChild(head);
+  tq.trades.forEach(t => {
+    const tr = el("tr");
+    tr.appendChild(td(t.symbol));
+    tr.appendChild(td(t.side));
+    tr.appendChild(el("td", null, [badge(t.model.startsWith("h2") ? "H2" : "BASELINE", t.model.startsWith("h2") ? "warn" : "ok")]));
+    tr.appendChild(td((t.duration_minutes ?? "N/D") + " min", "num"));
+    tr.appendChild(td(t.exit_reason));
+    tr.appendChild(td(fmt(t.normalized_separation, 4), "num"));
+    tr.appendChild(td(t.mfe_pct !== null ? fmt(t.mfe_pct, 3) + "%" : "N/D", "num"));
+    tr.appendChild(td(t.mae_pct !== null ? fmt(t.mae_pct, 3) + "%" : "N/D", "num"));
+    tr.appendChild(el("td", {class: "num " + pnlClass(t.net_pnl_usd)}, ["US$ " + fmt(t.net_pnl_usd, 4)]));
+    table.appendChild(tr);
+  });
+  wrap.appendChild(table);
+  box.appendChild(wrap);
+  if (tq.nota_mfe_mae) box.appendChild(el("div", {class: "sub", style: "margin-top:8px"}, [tq.nota_mfe_mae]));
+}
+
+// ---------------------------------------------------------------- render: SECAO 7 (progresso)
+function renderProgresso(progress) {
+  const box = document.getElementById("secao-7");
+  clear(box);
+  if (!progress) { box.appendChild(el("div", {class: "empty"}, ["sem dados"])); return; }
+  const nomes = {baseline_without_cost_gate: "Baseline", h2_ma_separation_015: "H2"};
+  for (const [chave, d] of Object.entries(progress)) {
+    const card = el("div", {class: "card"});
+    card.appendChild(el("h2", null, [nomes[chave] || chave, badge(d.trades_fechados + " trades", "off")]));
+    d.marcos.forEach(m => {
+      const label = el("div", {class: "milestone-label"});
+      label.appendChild(el("span", null, [m.alvo + " — " + m.descricao]));
+      label.appendChild(el("span", null, [m.atingido ? "atingido" : "faltam " + m.faltam]));
+      card.appendChild(label);
+      const track = el("div", {class: "progress-track"});
+      const pctFill = Math.min(100, d.trades_fechados / m.alvo * 100);
+      track.appendChild(el("div", {class: "progress-fill" + (m.atingido ? " done" : ""), style: "width:" + pctFill + "%"}));
+      card.appendChild(track);
+    });
+    card.appendChild(el("div", {class: "sub"}, [
+      "Marcos são informativos. Nenhum deles, isoladamente, libera promoção."]));
+    box.appendChild(card);
+  }
+}
+
+// ---------------------------------------------------------------- render: SECAO 8 (eventos)
+function renderEventos(ev) {
+  const box = document.getElementById("eventos-container");
+  clear(box);
+  if (!ev || !ev.events.length) { box.appendChild(el("div", {class: "empty"}, ["nenhum evento ainda"])); return; }
+  const wrap = el("div", {class: "table-scroll"});
+  const table = el("table");
+  table.appendChild(el("tr", null, ["Quando","Símbolo","Direção","Modelo","Decisão","Motivo","Separação","Cobertura","P&L"].map(t => el("th", null, [t]))));
+  ev.events.forEach(e => {
+    const tr = el("tr");
+    tr.appendChild(td(fmtData(e.quando)));
+    tr.appendChild(td(e.symbol));
+    tr.appendChild(td(e.direction));
+    tr.appendChild(el("td", null, [badge(e.model.startsWith("h2") ? "H2" : "BASELINE", e.model.startsWith("h2") ? "warn" : "ok")]));
+    tr.appendChild(td(e.decisao));
+    tr.appendChild(td(e.motivo || "—"));
+    tr.appendChild(td(e.normalized_separation !== null ? fmt(e.normalized_separation, 4) : "—", "num"));
+    tr.appendChild(td(e.cost_coverage_ratio !== null ? fmt(e.cost_coverage_ratio, 3) + "×" : "—", "num"));
+    tr.appendChild(el("td", {class: "num " + (e.pnl_usd !== null ? pnlClass(e.pnl_usd) : "pnl-nd")},
+                     [e.pnl_usd !== null ? "US$ " + fmt(e.pnl_usd, 4) : "—"]));
+    table.appendChild(tr);
+  });
+  wrap.appendChild(table);
+  box.appendChild(wrap);
+}
+
+function popularFiltros() {
+  const fModel = document.getElementById("f-model");
+  const fSymbol = document.getElementById("f-symbol");
+  if (fModel.dataset.populado) return;
+  ["baseline_without_cost_gate", "h2_ma_separation_015"].forEach(m => {
+    fModel.appendChild(el("option", {value: m}, [m === "baseline_without_cost_gate" ? "Baseline" : "H2"]));
+  });
+  ["BTCUSDT", "ETHUSDT", "SOLUSDT"].forEach(s => {
+    fSymbol.appendChild(el("option", {value: s}, [s]));
+  });
+  fModel.dataset.populado = "1";
+}
+
+// ---------------------------------------------------------------- ciclo de atualizacao
+// UMA ÚNICA requisição HTTP por ciclo automático: /api/diagnostics/dashboard.
+// A troca de filtro de rejeições (interação do usuário, não o ciclo
+// automático) dispara uma chamada adicional leve e isolada só daquela
+// seção -- nunca reabre as outras 7.
+let cicloEmAndamento = false;
+let ultimoSucesso = null;
+let ultimoDashboard = null;
+
+// `datetime-local` nao carrega fuso -- o valor digitado e' interpretado
+// como horario LOCAL do navegador (o mesmo fuso rotulado em FUSO_LABEL),
+// e convertido para UTC (via toISOString) so' na fronteira com a API.
+// Uma unica conversao, nunca duas.
+function datetimeLocalParaISO(valor) {
+  if (!valor) return null;
+  const d = new Date(valor);
+  return isNaN(d.getTime()) ? null : d.toISOString();
+}
+
+function validarPeriodoCustom() {
+  const sinceEl = document.getElementById("custom-since");
+  const untilEl = document.getElementById("custom-until");
+  if (!sinceEl.value || !untilEl.value) {
+    return {valido: false, erro: "Preencha início e fim antes de aplicar."};
+  }
+  const since = datetimeLocalParaISO(sinceEl.value);
+  const until = datetimeLocalParaISO(untilEl.value);
+  if (!since || !until) {
+    return {valido: false, erro: "Data/hora inválida."};
+  }
+  if (new Date(since) >= new Date(until)) {
+    return {valido: false, erro: "O início precisa ser anterior ao fim."};
+  }
+  return {valido: true, since, until};
+}
+
+function atualizarVisibilidadeCampoCustom() {
+  const scope = document.getElementById("scope-select").value;
+  document.getElementById("custom-period-fields").hidden = scope !== "custom";
+  document.getElementById("fuso-label-custom").textContent =
+    scope === "custom" ? "horário local (" + FUSO_LABEL + ")" : "";
+  if (scope !== "custom") {
+    const err = document.getElementById("custom-period-error");
+    err.hidden = true; clear(err);
+  }
+}
+
+async function atualizarTudo() {
+  if (cicloEmAndamento) return;          // apenas UMA atualizacao em andamento
+  if (document.hidden) return;           // pausado quando a aba esta oculta
+  cicloEmAndamento = true;
+  const banner = document.getElementById("stale-banner");
+  const erroCustom = document.getElementById("custom-period-error");
+  try {
+    const scope = document.getElementById("scope-select").value;
+    let params = {scope};
+    if (scope === "custom") {
+      const v = validarPeriodoCustom();
+      if (!v.valido) {
+        // Impede a requisicao com campos incompletos/invalidos -- preserva
+        // o ultimo resultado valido na tela, so' mostra o erro do periodo.
+        erroCustom.hidden = false;
+        clear(erroCustom);
+        erroCustom.appendChild(document.createTextNode(v.erro));
+        return;
+      }
+      erroCustom.hidden = true; clear(erroCustom);
+      params = {scope, since: v.since, until: v.until};
+    }
+    const d = await getJSON("/api/diagnostics/dashboard", params);
+    ultimoDashboard = d;
+
+    renderStatusExecutivo(d);
+    renderFunil(d.funnel);
+    renderComparacao(d.comparison);
+    renderCobertura(d.cost_gate);
+    popularFiltros();
+    renderRejeicoes(d.rejections);
+    renderQualidade(d.trade_quality);
+    renderProgresso(d.progress);
+    renderEventos(d.events);
+
+    ultimoSucesso = new Date();
+    backoffMs = 0;
+    banner.hidden = true;
+  } catch (e) {
+    // mantem o ultimo resultado valido na tela; so avisa que esta desatualizado
+    banner.hidden = false;
+    banner.textContent = "Não foi possível atualizar (" + e.message + "). Mostrando o último dado válido" +
+      (ultimoSucesso ? " de " + ultimoSucesso.toLocaleTimeString("pt-BR", {hour12:false}) : "") + ".";
+    backoffMs = Math.min(backoffMs ? backoffMs * 2 : 5000, 120000);
+  } finally {
+    cicloEmAndamento = false;
+  }
+}
+
+async function atualizarSomenteRejeicoes() {
+  if (!ultimoDashboard) return;
+  try {
+    const filtros = {
+      model: document.getElementById("f-model").value,
+      symbol: document.getElementById("f-symbol").value,
+      direction: document.getElementById("f-direction").value,
+    };
+    const r = await getJSON("/api/diagnostics/rejections", filtros);
+    renderRejeicoes(r);
+  } catch (e) {
+    // falha aqui nao derruba o resto do painel -- so' a secao de rejeicoes
+    // fica com o ultimo dado valido.
+  }
+}
+
+function agendarProximo() {
+  setTimeout(async () => {
+    await atualizarTudo();
+    agendarProximo();
+  }, POLL_MS + backoffMs);
+}
+
+document.getElementById("refresh-btn").addEventListener("click", atualizarTudo);
+document.getElementById("scope-select").addEventListener("change", () => {
+  atualizarVisibilidadeCampoCustom();
+  // "custom" so' busca quando o operador clicar "Aplicar" (campos comecam
+  // vazios); os demais escopos atualizam na hora, como antes.
+  if (document.getElementById("scope-select").value !== "custom") atualizarTudo();
+});
+document.getElementById("custom-apply-btn").addEventListener("click", atualizarTudo);
+document.getElementById("f-model").addEventListener("change", atualizarSomenteRejeicoes);
+document.getElementById("f-symbol").addEventListener("change", atualizarSomenteRejeicoes);
+document.getElementById("f-direction").addEventListener("change", atualizarSomenteRejeicoes);
+document.addEventListener("visibilitychange", () => { if (!document.hidden) atualizarTudo(); });
+
+atualizarVisibilidadeCampoCustom();
+atualizarTudo();
+agendarProximo();
+</script>
+</body>
+</html>

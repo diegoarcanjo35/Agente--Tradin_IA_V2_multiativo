@@ -429,14 +429,16 @@ def test_migration_v9_sobre_banco_existente(tmp_path):
     with eng.begin() as conn:          # simula banco anterior à v9
         for t in ("shadow_trades", "shadow_positions", "shadow_opportunities"):
             conn.execute(text(f"DROP TABLE IF EXISTS {t}"))
-        conn.execute(text("DELETE FROM schema_migrations WHERE version = 9"))
+        # v10 (Fase 3.5) vem depois de v9 -- pra simular "banco antes de
+        # v9" a contiguidade exige remover tambem a linha de v10.
+        conn.execute(text("DELETE FROM schema_migrations WHERE version IN (9, 10)"))
     run_migrations(eng)
     with eng.begin() as conn:
         nomes = {r[0] for r in conn.execute(text(
             "SELECT name FROM sqlite_master WHERE type='table'")).fetchall()}
         assert {"shadow_opportunities", "shadow_positions", "shadow_trades"} <= nomes
         v = conn.execute(text("SELECT MAX(version) FROM schema_migrations")).scalar()
-        assert v == CURRENT_SCHEMA_VERSION == 9
+        assert v == CURRENT_SCHEMA_VERSION == 10
     run_migrations(eng)                # idempotente: rodar de novo é no-op
     with eng.begin() as conn:
         assert conn.execute(text(

@@ -368,7 +368,7 @@ def test_migration_v9_banco_novo_e_idempotente(tmp_path):
     eng = make_engine(f"sqlite:///{tmp_path / 'novo.db'}")
     init_db(eng)
     run_migrations(eng)
-    assert current_schema_version(eng) == CURRENT_SCHEMA_VERSION == 9
+    assert current_schema_version(eng) == CURRENT_SCHEMA_VERSION == 10
     r = run_migrations(eng)
     assert r.applied == [], "reexecutar é no-op"
 
@@ -381,11 +381,14 @@ def test_migration_v9_upgrade_real_de_v8(tmp_path):
         for t in ("shadow_trades", "shadow_positions",
                   "shadow_opportunities", "shadow_experiments"):
             c.execute(text(f"DROP TABLE IF EXISTS {t}"))
-        c.execute(text("DELETE FROM schema_migrations WHERE version = 9"))
+        # v10 (Fase 3.5) vem depois de v9 -- pra simular "banco em v8" a
+        # contiguidade exige remover tambem a linha de v10.
+        c.execute(text("DELETE FROM schema_migrations WHERE version IN (9, 10)"))
     assert current_schema_version(eng) == 8
 
     r = run_migrations(eng)
     assert 9 in r.applied
+    assert 10 in r.applied
     with eng.begin() as c:
         nomes = {x[0] for x in c.execute(text(
             "SELECT name FROM sqlite_master WHERE type='table'")).fetchall()}

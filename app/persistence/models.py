@@ -59,7 +59,11 @@ class StrategySignal(Base):
     observed_price: Mapped[float] = mapped_column(Float)
     atr: Mapped[float] = mapped_column(Float)
     params_json: Mapped[str] = mapped_column(Text)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    # Fase 3.5 (auditoria do painel de diagnóstico): medido com EXPLAIN
+    # QUERY PLAN -- toda janela temporal do funil/gate de custos filtra por
+    # este campo, e sem índice o SQLite fazia SCAN completo da tabela (full
+    # scan CRESCENTE, não um custo fixo). Índice simples, migration v10.
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
     # Fase 3.1 (correção final auditoria PO): identidade determinística do
     # candle que gerou este sinal -- SEMPRE `candle.open_time`, nunca
     # derivado de preço ou de `created_at`. Nullable para compatibilidade
@@ -90,7 +94,10 @@ class RiskEvaluation(Base):
     __tablename__ = "risk_evaluations"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    signal_id: Mapped[int] = mapped_column(ForeignKey("strategy_signals.id"))
+    # Fase 3.5: indexado -- o painel de diagnóstico busca a avaliação de
+    # risco de cada sinal por este campo; sem índice o SQLite varria a
+    # tabela inteira (medido). Migration v10.
+    signal_id: Mapped[int] = mapped_column(ForeignKey("strategy_signals.id"), index=True)
     approved: Mapped[bool] = mapped_column(Boolean)
     reason: Mapped[str] = mapped_column(Text)
     checks_json: Mapped[str] = mapped_column(Text)
