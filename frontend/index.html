@@ -55,21 +55,31 @@
       <div id="chart-banner" class="chart-banner">CARREGANDO MODO…</div>
       <div id="chart-data-disclaimer" class="chart-disclaimer" hidden></div>
       <div class="chart-header">
-        <label for="chart-symbol-select">Símbolo:</label>
+        <label for="chart-symbol-select">Ativo:</label>
         <select id="chart-symbol-select"></select>
         <span id="chart-timeframe" class="chip">Mercado: --</span>
         <span id="chart-strategy-timeframe" class="chip chip-strategy">Estratégia: --</span>
         <span id="chart-warmup" class="chip">Aquecimento: --</span>
         <span id="chart-visual-price" class="chip">Preço: --</span>
+        <span id="chart-forming-indicator" class="chip" hidden>Candle em formação</span>
         <span id="chart-status" class="chip">Status: --</span>
         <span id="chart-position-state" class="chip">SEM POSIÇÃO</span>
+        <span id="chart-last-updated" class="chip">Atualizado: --</span>
         <span class="chart-window-buttons">
           <button type="button" class="btn-secondary chart-window-btn" data-window="1h">1h</button>
           <button type="button" class="btn-secondary chart-window-btn" data-window="4h">4h</button>
           <button type="button" class="btn-secondary chart-window-btn" data-window="12h">12h</button>
           <button type="button" class="btn-secondary chart-window-btn" data-window="24h">24h</button>
-          <button type="button" class="btn-secondary chart-window-btn" data-window="all">Tudo disponível</button>
+          <button type="button" class="btn-secondary chart-window-btn" data-window="all">Todo o histórico</button>
         </span>
+      </div>
+      <div class="chart-live-controls">
+        <span id="chart-live-indicator" class="chart-live-indicator">
+          <span class="dot"></span><span class="label">Acompanhando mercado</span>
+        </span>
+        <button type="button" id="chart-back-to-live-btn" class="btn-chart-action" hidden>Voltar ao tempo atual</button>
+        <button type="button" id="chart-reset-zoom-btn" class="btn-chart-action">Redefinir zoom</button>
+        <button type="button" id="chart-expand-btn" class="btn-chart-action">Expandir gráfico</button>
       </div>
       <div id="chart-container">
         <div id="chart-loading" class="chart-message">Carregando...</div>
@@ -87,13 +97,25 @@
       </p>
     </section>
 
+    <!-- Fase 3.6, item 6: explicação objetiva com dados reais -- nunca
+         afirmação de lucratividade/validação/calibração sem evidência.
+         Correção pós-auditoria (3ª rodada, item 1): título NUNCA fixo --
+         "nenhuma operação foi aberta" era historicamente falso sempre
+         que a sessão realmente teve aberturas aprovadas. Preenchido
+         dinamicamente por refreshWhyNoTrades() conforme os dados reais
+         da sessão atual. -->
+    <section class="card">
+      <h2 id="why-no-trade-title">Funil de decisões e operações</h2>
+      <div id="why-no-trade-box">Carregando...</div>
+    </section>
+
     <!-- D. Resumo por Símbolo -->
     <section class="card">
-      <h2>Resumo por Símbolo (Carteira Multiativo)</h2>
+      <h2>Resumo por Ativo (Carteira Multiativo)</h2>
       <div class="table-scroll">
         <table id="symbols-summary-table">
           <thead><tr>
-            <th>Símbolo</th><th>Saúde</th><th>Preço</th><th>Posição</th>
+            <th>Ativo</th><th>Saúde</th><th>Preço</th><th>Posição</th>
             <th>Exposição</th><th>Realizado</th><th>Não realizado</th><th>Último sinal</th>
           </tr></thead>
           <tbody></tbody>
@@ -122,37 +144,40 @@
       <div id="costs-box" class="hero-grid hero-grid-compact">Carregando...</div>
       <div class="table-scroll">
         <table id="costs-by-symbol-table">
-          <thead><tr><th>Símbolo</th><th>Ordens</th><th>Taxas</th><th>Slippage adverso</th><th>Melhoria</th></tr></thead>
+          <thead><tr><th>Ativo</th><th>Ordens</th><th>Taxas</th><th>Slippage adverso</th><th>Melhoria</th></tr></thead>
           <tbody></tbody>
         </table>
       </div>
     </section>
 
+    <!-- 9. Posições e Ordens -->
     <section class="grid-2">
       <div class="card">
         <h2>Posições Abertas</h2>
-        <table id="positions-table"><thead><tr><th>Símbolo</th><th>Lado</th><th>Qtd</th><th>Entrada</th><th>Stop</th><th>Alvo</th></tr></thead><tbody></tbody></table>
+        <table id="positions-table"><thead><tr><th>Ativo</th><th>Lado</th><th>Qtd</th><th>Entrada</th><th>Stop</th><th>Alvo</th></tr></thead><tbody></tbody></table>
       </div>
       <div class="card">
-        <h2>Sinais da Estratégia</h2>
-        <table id="signals-table"><thead><tr><th>Hora</th><th>Símbolo</th><th>Direção</th><th>Preço</th><th>Justificativa</th></tr></thead><tbody></tbody></table>
+        <h2>Ordens e Máquina de Estados</h2>
+        <table id="orders-table"><thead><tr><th>Hora</th><th>Ativo</th><th>Lado</th><th>Status</th><th>Qtd Executada</th><th>Preço Médio</th></tr></thead><tbody></tbody></table>
       </div>
     </section>
 
+    <!-- 10. Sinais -->
     <section class="grid-2">
       <div class="card">
-        <h2>Ordens e Máquina de Estados</h2>
-        <table id="orders-table"><thead><tr><th>Hora</th><th>Símbolo</th><th>Lado</th><th>Status</th><th>Qtd Preenchida</th><th>Preço Médio</th></tr></thead><tbody></tbody></table>
+        <h2>Sinais da Estratégia</h2>
+        <table id="signals-table"><thead><tr><th>Hora</th><th>Ativo</th><th>Direção</th><th>Preço</th><th>Justificativa</th></tr></thead><tbody></tbody></table>
       </div>
       <div class="card">
-        <h2>Decisões do Motor de Risco (Risk Engine)</h2>
+        <h2>Validação de Segurança e Custos (Risk Engine)</h2>
         <table id="risk-table"><thead><tr><th>Hora</th><th>Situação</th><th>Motivo</th></tr></thead><tbody></tbody></table>
       </div>
     </section>
 
+    <!-- 11. Laboratório de estratégias -->
     <section class="card">
-      <h2>IA em Modo de Observação (Shadow Mode) — nunca executa ordens</h2>
-      <table id="ai-table"><thead><tr><th>Hora</th><th>Símbolo</th><th>Recomendação</th><th>Confiança</th><th>Resumo</th></tr></thead><tbody></tbody></table>
+      <h2>Laboratório de Estratégias (Shadow Mode) — nunca executa ordens</h2>
+      <table id="ai-table"><thead><tr><th>Hora</th><th>Ativo</th><th>Recomendação</th><th>Confiança</th><th>Resumo</th></tr></thead><tbody></tbody></table>
     </section>
 
     <!-- G. Diagnóstico técnico -->

@@ -229,18 +229,55 @@ footer { padding: 20px; color: var(--muted); font-size: 12px; }
   padding: 4px 8px;
 }
 
-.chart-window-buttons { display: flex; gap: 6px; margin-left: auto; }
+.chart-window-buttons { display: flex; gap: 6px; margin-left: auto; flex-wrap: wrap; }
 .chart-window-btn { padding: 4px 10px; font-size: 12px; }
 .chart-window-btn.active { background: var(--accent); color: #071022; }
+
+/* Fase 3.6: controles de modo ao vivo/exploração -- nunca só cor, sempre
+   texto explícito (mesmo padrão já usado nos chips de estado). */
+.chart-live-controls { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.chart-live-indicator {
+  display: inline-flex; align-items: center; gap: 6px;
+  border: 1px solid var(--green); color: var(--green);
+  border-radius: 999px; padding: 4px 10px; font-size: 11.5px; font-weight: 700;
+}
+.chart-live-indicator .dot {
+  width: 6px; height: 6px; border-radius: 50%; background: var(--green);
+  animation: chart-live-pulse 1.6s ease-in-out infinite;
+}
+@keyframes chart-live-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
+.chart-live-indicator.exploring { border-color: var(--amber); color: var(--amber); }
+.chart-live-indicator.exploring .dot { background: var(--amber); animation: none; }
+
+.btn-chart-action {
+  border: 1px solid var(--accent); color: var(--accent); background: transparent;
+  border-radius: 6px; padding: 5px 11px; font-size: 12px; font-weight: 600; cursor: pointer;
+}
+.btn-chart-action:hover { background: rgba(96, 165, 250, 0.12); }
+.btn-chart-action[hidden] { display: none; }
 
 #chart-container {
   position: relative;
   width: 100%;
-  height: 420px;
+  height: 560px;
   background: #0c1120;
   border-radius: 8px;
   overflow: hidden;
 }
+@media (min-width: 900px) {
+  #chart-container { height: 620px; }
+}
+
+/* Fase 3.6: modo expandido -- o card do gráfico ocupa a tela inteira
+   dentro da própria página (nunca um <iframe>/nova aba), sem recriar o
+   chart (só o container muda de tamanho; a lib redimensiona via
+   autoSize/ResizeObserver). */
+#chart-card.chart-expanded {
+  position: fixed; inset: 0; z-index: 50; margin: 0; border-radius: 0;
+  overflow-y: auto; max-width: none;
+}
+#chart-card.chart-expanded #chart-container { height: calc(100vh - 260px); }
+body.chart-expanded-active { overflow: hidden; }
 
 .chart-message {
   position: absolute;
@@ -250,6 +287,38 @@ footer { padding: 20px; color: var(--muted); font-size: 12px; }
   justify-content: center;
   color: var(--muted);
   font-size: 13px;
+  text-align: center;
+  padding: 20px;
+}
+.chart-message.chart-error { color: var(--red); }
+
+/* Tooltip OHLCV customizado (crosshair) -- nunca innerHTML, todo texto
+   inserido via textContent em app.js. */
+.chart-tooltip {
+  position: absolute;
+  pointer-events: none;
+  z-index: 5;
+  background: var(--card-bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px 10px;
+  font-size: 11.5px;
+  line-height: 1.5;
+  min-width: 180px;
+  box-shadow: 0 8px 20px -8px rgba(0,0,0,0.6);
+}
+.chart-tooltip .tt-row { display: flex; justify-content: space-between; gap: 12px; white-space: nowrap; }
+.chart-tooltip .tt-label { color: var(--muted); }
+.chart-tooltip .tt-value { font-weight: 700; }
+
+/* Ícone de ajuda -- tooltip nativo (title) com explicação curta em
+   português simples, mesmo padrão acessível já usado em statCard(). */
+.help-icon {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 14px; height: 14px; border-radius: 50%;
+  border: 1px solid var(--muted); color: var(--muted);
+  font-size: 10px; font-weight: 700; margin-left: 4px; cursor: help;
+  flex-shrink: 0;
 }
 
 /* Faixas translúcidas de posição -- <div>s posicionados por preço via
@@ -333,3 +402,34 @@ html, body { max-width: 100%; overflow-x: hidden; }
   color: #e8c86a;
   font-size: 0.85rem;
 }
+
+/* Fase 3.6, item 6: "Por que nenhuma operação foi aberta?" -- explicação
+   objetiva com dados reais, nunca afirmação de lucratividade/calibração
+   sem evidência (item 6 do brief). */
+.why-no-trade-summary {
+  font-size: 13px; color: var(--text); margin: 0 0 12px; line-height: 1.5;
+}
+.why-no-trade-summary strong { color: var(--accent); }
+.why-no-trade-caveat {
+  font-size: 12px; color: var(--muted); margin-top: 10px;
+  border-top: 1px solid var(--border); padding-top: 8px;
+}
+
+/* Fase 3.6, item 7: estados visuais claros -- nunca verde para P&L
+   líquido negativo, amostra inconclusiva, ausência de dados ou gate
+   apenas tecnicamente funcional. */
+.state-pill {
+  display: inline-flex; align-items: center; gap: 6px;
+  border-radius: 999px; padding: 3px 10px; font-size: 11px; font-weight: 700;
+  border: 1px solid var(--border); color: var(--muted);
+}
+.state-pill.state-ok { border-color: var(--green); color: var(--green); }
+.state-pill.state-warn { border-color: var(--amber); color: var(--amber); }
+.state-pill.state-bad { border-color: var(--red); color: var(--red); }
+.state-pill.state-neutral { border-color: var(--muted); color: var(--muted); }
+
+.empty-state, .error-state, .stale-state {
+  font-size: 12.5px; color: var(--muted); padding: 10px 0;
+}
+.error-state { color: var(--red); }
+.stale-state { color: var(--amber); }

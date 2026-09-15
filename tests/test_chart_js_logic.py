@@ -20,6 +20,23 @@ APP_JS = FRONTEND_DIR / "app.js"
 
 NODE = shutil.which("node")
 
+# Fase 3.6: app.js termina com um bootstrap incondicional
+# (`refreshAll(); setInterval(refreshAll, 2000);`) que dispara IMEDIATAMENTE
+# ao avaliar o arquivo inteiro -- concorrendo, de forma assíncrona e não
+# determinística, com as chamadas manuais e controladas que estes harnesses
+# fazem (mais evidente desde que refreshWhyNoTrades() -- que estes mocks
+# antigos não simulam -- entrou no Promise.all de refreshAll()). Extrai só
+# até ANTES dessa linha, mesma técnica já usada para frontend/shadow.html.
+_BOOTSTRAP_MARKER = "refreshAll();\nsetInterval(refreshAll, 2000);"
+
+
+def _app_js_without_bootstrap(tmp_path) -> Path:
+    code = APP_JS.read_text(encoding="utf-8")
+    trimmed = code[: code.index(_BOOTSTRAP_MARKER)]
+    out = tmp_path / "app_no_bootstrap.js"
+    out.write_text(trimmed, encoding="utf-8")
+    return out
+
 # --- item 13: computeSMA pure-function fixture -------------------------------
 
 _SMA_HARNESS = r"""
@@ -44,6 +61,7 @@ global.document = {
 global.fetch = () => Promise.resolve({ json: () => Promise.resolve([]) });
 global.setInterval = () => {};
 global.window = global;
+global.addEventListener = () => {};
 process.on("unhandledRejection", () => {});
 
 const fs = require("fs");
@@ -60,10 +78,11 @@ console.log(JSON.stringify({ sma3, sma5 }));
 
 @pytest.mark.skipif(NODE is None, reason="Node.js not available in this environment")
 def test_compute_sma_matches_hand_calculated_fixture(tmp_path):
+    script_path = _app_js_without_bootstrap(tmp_path)
     harness_path = tmp_path / "sma_harness.js"
     harness_path.write_text(_SMA_HARNESS, encoding="utf-8")
     result = subprocess.run(
-        [NODE, str(harness_path), str(APP_JS)], capture_output=True, text=True, timeout=30, encoding="utf-8",
+        [NODE, str(harness_path), str(script_path)], capture_output=True, text=True, timeout=30, encoding="utf-8",
     )
     assert result.returncode == 0, f"harness failed: {result.stderr}"
     data = json.loads(result.stdout.strip().splitlines()[-1])
@@ -89,6 +108,7 @@ class FakeElement {
     this.tag = tag; this.id = id || ""; this.children = [];
     this._text = ""; this.className = ""; this.style = new FakeStyle();
     this.dataset = {}; this._value = "";
+    this.classList = { toggle() {}, add() {}, remove() {}, contains() { return false; } };
   }
   set textContent(v) { this._text = String(v); this.children = []; }
   get textContent() { return this._text; }
@@ -120,6 +140,7 @@ global.document = {
   querySelectorAll: () => [],
 };
 global.window = global;
+global.addEventListener = () => {};
 global.setInterval = () => {};
 process.on("unhandledRejection", () => {});
 global.ResizeObserver = class { observe() {} };
@@ -139,7 +160,8 @@ function makeFakeChart() {
     addCandlestickSeries: makeFakeSeries,
     addHistogramSeries: makeFakeSeries,
     addLineSeries: makeFakeSeries,
-    timeScale() { return { subscribeVisibleTimeRangeChange() {}, fitContent() {}, setVisibleRange() {} }; },
+    timeScale() { return { subscribeVisibleTimeRangeChange() {}, fitContent() {}, setVisibleRange() {}, getVisibleRange() { return null; } }; },
+    subscribeCrosshairMove() {},
     remove() {},
   };
 }
@@ -201,10 +223,11 @@ main();
 
 @pytest.mark.skipif(NODE is None, reason="Node.js not available in this environment")
 def test_fast_symbol_switch_discards_stale_response_and_clears_overlay(tmp_path):
+    script_path = _app_js_without_bootstrap(tmp_path)
     harness_path = tmp_path / "chart_harness.js"
     harness_path.write_text(_CHART_HARNESS, encoding="utf-8")
     result = subprocess.run(
-        [NODE, str(harness_path), str(APP_JS)], capture_output=True, text=True, timeout=30, encoding="utf-8",
+        [NODE, str(harness_path), str(script_path)], capture_output=True, text=True, timeout=30, encoding="utf-8",
     )
     assert result.returncode == 0, f"harness failed: {result.stderr}"
     data = json.loads(result.stdout.strip().splitlines()[-1])

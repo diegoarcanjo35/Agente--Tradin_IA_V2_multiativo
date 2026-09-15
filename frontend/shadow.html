@@ -174,7 +174,7 @@
 
   <!-- SEÇÃO 4 -->
   <div class="card" style="margin-bottom:14px">
-    <h2>Cobertura de custos <span class="badge off">limiar operacional 3,0×</span></h2>
+    <h2>Cobertura de custos <span class="badge off" id="badge-limiar-operacional">limiar operacional --</span></h2>
     <div id="cobertura-container"></div>
   </div>
 
@@ -191,7 +191,7 @@
 
   <!-- SEÇÃO 6 -->
   <div class="card" style="margin-bottom:14px">
-    <h2>Qualidade das entradas <span class="tooltip">(MFE/MAE)<span class="bubble">MFE: máxima excursão favorável — o quanto o preço chegou a andar a favor da posição antes do fechamento. MAE: máxima excursão adversa — o quanto andou contra.</span></span></h2>
+    <h2>Qualidade das entradas <span class="tooltip">(Maior movimento favorável/contrário — MFE/MAE)<span class="bubble">MFE (maior movimento favorável): o quanto o preço chegou a andar a favor da posição antes do fechamento. MAE (maior movimento contrário): o quanto andou contra.</span></span></h2>
     <div id="qualidade-container"></div>
   </div>
 
@@ -214,6 +214,10 @@ const API = "";
 const POLL_MS = 30000;
 
 // ---------------------------------------------------------------- utils
+// Correção da 2a auditoria da Fase 3.6, item 6: nomenclaturas do brief
+// aplicadas também em frontend/shadow.html, não só em index.html/app.js.
+const DIRECTION_LABELS = { BUY: "COMPRA", SELL: "VENDA", HOLD: "AGUARDAR" };
+function translateDirection(direction) { return DIRECTION_LABELS[direction] || direction; }
 function fmt(n, casas) {
   casas = casas === undefined ? 2 : casas;
   if (n === null || n === undefined || Number.isNaN(n)) return "N/D";
@@ -297,7 +301,7 @@ function renderStatusExecutivo(d) {
   const box = document.getElementById("secao-1");
   clear(box);
   document.getElementById("banner-shadow-mode").textContent =
-    "SHADOW — NÃO EXECUTA ORDENS. Observação pura, patrimônio nunca compartilhado com a operação real.";
+    "Laboratório de Estratégias (Shadow Mode) — NÃO EXECUTA ORDENS. Observação pura, patrimônio nunca compartilhado com a operação real.";
   document.getElementById("window-banner").textContent =
     "Janela: " + d.window.rotulo + " (" + fmtData(d.window.desde) + " → " + fmtData(d.window.ate) +
     ") | gerado às " + fmtData(d.generated_at);
@@ -384,8 +388,9 @@ function renderFunil(funnel) {
   const maxN = Math.max(...etapas.map(e => e.total || 0), 1);
   const nomes = {
     candles_1m: "Candles de 1 min", buckets_15m_fechados: "Buckets de 15 min",
-    sinais_gerados: "Sinais gerados", sinais_acionaveis: "Sinais acionáveis (BUY/SELL)",
-    avaliados_risk_engine: "Avaliados pelo RiskEngine", aprovados_gate_operacional_real: "Aprovados pelo gate real",
+    sinais_gerados: "Sinais gerados", sinais_acionaveis: "Sinais acionáveis (COMPRA/VENDA)",
+    avaliados_risk_engine: "Avaliados pela validação de segurança e custos (Risk Engine)",
+    aprovados_gate_operacional_real: "Aprovados pelo filtro de viabilidade da operação (Cost Gate) real",
     ordens_criadas: "Ordens criadas", fills: "Fills", posicoes_operacionais: "Posições operacionais",
   };
   etapas.forEach(e => {
@@ -408,7 +413,7 @@ function renderComparacao(comparison) {
   const box = document.getElementById("secao-3");
   clear(box);
   if (!comparison) { box.appendChild(el("div", {class: "empty"}, ["sem dados"])); return; }
-  const nomes = {baseline_without_cost_gate: "Baseline (sem portão de custo)", h2_ma_separation_015: "H2 (separação ≥ 0,15)"};
+  const nomes = {baseline_without_cost_gate: "Comparação sem filtro de custos (Baseline)", h2_ma_separation_015: "Modelo experimental: força do cruzamento (H2, separação ≥ 0,15)"};
   for (const [chave, d] of Object.entries(comparison)) {
     const card = el("div", {class: "card"});
     const h = el("h2", null, [nomes[chave] || chave]);
@@ -422,12 +427,12 @@ function renderComparacao(comparison) {
       ["Taxa de acerto", d.win_rate !== null ? fmtPct(d.win_rate, 1) : "N/D"],
       ["P&L bruto", "US$ " + fmt(d.gross_pnl_usd, 4)],
       ["Taxas", "US$ " + fmt(-(d.fees_usd || 0), 4)],
-      ["Slippage", "US$ " + fmt(-(d.slippage_usd || 0), 4)],
+      ["Diferença entre preço esperado e executado (Slippage)", "US$ " + fmt(-(d.slippage_usd || 0), 4)],
       ["P&L líquido", "US$ " + fmt(d.net_pnl_usd, 4)],
-      ["Payoff", d.payoff !== null ? fmt(d.payoff, 3) : "N/D"],
-      ["Profit factor", d.profit_factor !== null ? fmt(d.profit_factor, 3) : "N/D"],
-      ["Expectativa/trade", "US$ " + fmt(d.expectancy_usd, 4)],
-      ["Drawdown", "US$ " + fmt(d.drawdown_usd, 4)],
+      ["Ganho médio comparado à perda média (Payoff)", d.payoff !== null ? fmt(d.payoff, 3) : "N/D"],
+      ["Relação entre ganhos e perdas (Profit Factor)", d.profit_factor !== null ? fmt(d.profit_factor, 3) : "N/D"],
+      ["Resultado médio por operação (Expectancy)", "US$ " + fmt(d.expectancy_usd, 4)],
+      ["Maior queda do patrimônio (Drawdown)", "US$ " + fmt(d.drawdown_usd, 4)],
       ["Sequência máx. de perdas", d.max_losing_streak],
       ["Duração média", d.avg_duration_minutes !== null ? fmt(d.avg_duration_minutes, 0) + " min" : "N/D"],
     ];
@@ -443,10 +448,10 @@ function renderComparacao(comparison) {
       const p = d.current_position;
       card.appendChild(el("h3", {style: "margin-top:10px"}, ["Posição atual"]));
       const kv2 = el("div", {class: "kv"});
-      [["Símbolo", p.symbol], ["Lado", p.side], ["Entrada", fmt(p.entry_fill_price)],
+      [["Símbolo", p.symbol], ["Lado", translateDirection(p.side)], ["Entrada", fmt(p.entry_fill_price)],
        ["Stop", fmt(p.stop_loss)], ["Alvo", fmt(p.take_profit)],
-       ["MFE até agora", p.mfe_pct_ate_agora !== null && p.mfe_pct_ate_agora !== undefined ? fmt(p.mfe_pct_ate_agora, 3) + "%" : "N/D"],
-       ["MAE até agora", p.mae_pct_ate_agora !== null && p.mae_pct_ate_agora !== undefined ? fmt(p.mae_pct_ate_agora, 3) + "%" : "N/D"]]
+       ["Maior movimento favorável até agora (MFE)", p.mfe_pct_ate_agora !== null && p.mfe_pct_ate_agora !== undefined ? fmt(p.mfe_pct_ate_agora, 3) + "%" : "N/D"],
+       ["Maior movimento contrário até agora (MAE)", p.mae_pct_ate_agora !== null && p.mae_pct_ate_agora !== undefined ? fmt(p.mae_pct_ate_agora, 3) + "%" : "N/D"]]
        .forEach(([k, v]) => {
         kv2.appendChild(el("div", {class: "k"}, [k])); kv2.appendChild(el("div", {class: "v"}, [String(v)]));
       });
@@ -460,6 +465,18 @@ function renderComparacao(comparison) {
 
 // ---------------------------------------------------------------- render: SECAO 4 (cobertura)
 function renderCobertura(cg) {
+  // Correção da 2a auditoria, item 1: este rótulo era um texto FIXO
+  // ("3,0×") na marcação estática, nunca atualizado -- divergia de
+  // qualquer configuração real diferente do default original (ex.: a V2
+  // operacional roda com MINIMUM_COST_COVERAGE_RATIO=1.5). Agora lê o
+  // MESMO valor ao vivo (`cg.limiar_operacional`) já usado na tabela
+  // abaixo, nunca mais um literal solto.
+  const badge = document.getElementById("badge-limiar-operacional");
+  if (badge) {
+    badge.textContent = cg && cg.limiar_operacional !== undefined && cg.limiar_operacional !== null
+      ? "limiar operacional " + fmt(cg.limiar_operacional, 1) + "× (configuração ao vivo deste processo)"
+      : "limiar operacional N/D";
+  }
   const box = document.getElementById("cobertura-container");
   clear(box);
   if (!cg || !cg.n) { box.appendChild(el("div", {class: "empty"}, ["sem avaliações de risco na janela"])); return; }
@@ -491,8 +508,9 @@ function renderCobertura(cg) {
 // ---------------------------------------------------------------- render: SECAO 5 (rejeicoes)
 const NOMES_CATEGORIA = {
   aprovado: "Aprovado", separacao_h2_insuficiente: "Separação H2 insuficiente",
-  exposicao_esgotada: "Exposição esgotada", cooldown: "Cooldown ativo",
-  notional_minimo: "Notional abaixo do mínimo", sinal_oposto: "Sinal oposto (fechou posição)",
+  exposicao_esgotada: "Capital em posições no limite (Exposição)",
+  cooldown: "Em período de espera após perdas (cooldown)",
+  notional_minimo: "Valor da ordem abaixo do mínimo permitido", sinal_oposto: "Sinal oposto (fechou posição)",
   saida_mesmo_tick: "Saída no mesmo tick", limite_perda_diaria: "Limite de perda diária",
   posicao_ja_aberta: "Posição já aberta", outro: "Outro",
 };
@@ -524,7 +542,7 @@ function renderQualidade(tq) {
   tq.trades.forEach(t => {
     const tr = el("tr");
     tr.appendChild(td(t.symbol));
-    tr.appendChild(td(t.side));
+    tr.appendChild(td(translateDirection(t.side)));
     tr.appendChild(el("td", null, [badge(t.model.startsWith("h2") ? "H2" : "BASELINE", t.model.startsWith("h2") ? "warn" : "ok")]));
     tr.appendChild(td((t.duration_minutes ?? "N/D") + " min", "num"));
     tr.appendChild(td(t.exit_reason));
@@ -576,7 +594,7 @@ function renderEventos(ev) {
     const tr = el("tr");
     tr.appendChild(td(fmtData(e.quando)));
     tr.appendChild(td(e.symbol));
-    tr.appendChild(td(e.direction));
+    tr.appendChild(td(translateDirection(e.direction)));
     tr.appendChild(el("td", null, [badge(e.model.startsWith("h2") ? "H2" : "BASELINE", e.model.startsWith("h2") ? "warn" : "ok")]));
     tr.appendChild(td(e.decisao));
     tr.appendChild(td(e.motivo || "—"));
