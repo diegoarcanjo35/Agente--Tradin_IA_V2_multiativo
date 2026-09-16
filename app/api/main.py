@@ -456,6 +456,21 @@ def build_orchestrator(settings, bybit_transport=None) -> Orchestrator | MultiSy
         # contador operacional e não chama o motor de risco.
         orchestrator.hydrate_strategy_state(session)
 
+        # 2026-09-11: hidrata o book de posições do execution_engine a
+        # partir do banco ANTES da reconciliação -- PaperLocalExecutionEngine
+        # guarda posições só em memória (nunca persiste "o que a corretora
+        # sabe"), então sem isso todo reinício com uma posição real aberta
+        # produz uma divergência de reconciliação falsa ("corretora não
+        # reporta nenhuma"), bloqueando a operação por engano. Só existe em
+        # PAPER_LOCAL/PAPER_LIVE (BYBIT_DEMO consulta a corretora de
+        # verdade via get_position(), nunca precisa disso).
+        hydrate_positions = getattr(execution_engine, "hydrate_positions", None)
+        if hydrate_positions is not None:
+            hydrate_positions([
+                {"symbol": p.symbol, "side": p.side, "qty": p.qty, "avg_entry_price": p.avg_entry_price}
+                for p in repo.open_positions(session)
+            ])
+
         orchestrator.reconcile(session, state)
 
         state.operational_state = "BLOQUEADO" if state.trading_blocked else "OBSERVANDO"

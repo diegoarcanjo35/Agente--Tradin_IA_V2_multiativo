@@ -140,3 +140,32 @@ class PaperLocalExecutionEngine:
 
     def get_position(self, symbol: str) -> dict | None:
         return self._positions.get(symbol)
+
+    def hydrate_positions(self, positions: list[dict]) -> None:
+        """Restaura o book de posições em memória a partir do banco no
+        boot. Sem isso, `self._positions` sempre volta vazio a cada
+        reinício do processo, e a reconciliação de startup (que compara
+        posição local persistida contra `get_position()`) sempre encontra
+        uma divergência falsa ("corretora não reporta nenhuma") sempre que
+        houver uma posição real aberta -- a "corretora" aqui é só este
+        dicionário em memória, não uma corretora de verdade. Cada dict em
+        `positions` precisa ter symbol/side/qty/avg_entry_price. Chamado
+        uma única vez, antes da primeira reconciliação; nunca gera fill,
+        ordem ou efeito colateral.
+
+        Substitui integralmente `self._positions` (nunca faz merge sobre um
+        estado anterior) -- chamadas repetidas são idempotentes mesmo que a
+        lista informada mude entre uma chamada e outra, e nenhuma posição
+        antiga fica presa caso não reapareça na lista mais recente. Uma
+        posição com `qty <= 0` nunca é hidratada: `status == "OPEN"` com
+        quantidade zero/negativa é um estado inconsistente que não deveria
+        existir no banco (fechamento sempre muda `status` para `CLOSED`),
+        e propagá-lo para o book em memória do simulador só criaria uma
+        posição fantasma sem contrapartida real."""
+        self._positions = {
+            pos["symbol"]: {
+                "symbol": pos["symbol"], "side": pos["side"],
+                "qty": pos["qty"], "avg_entry_price": pos["avg_entry_price"],
+            }
+            for pos in positions if pos["qty"] > 0
+        }
