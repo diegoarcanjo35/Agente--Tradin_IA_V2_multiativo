@@ -898,7 +898,22 @@ function ensureChart(symbol) {
     layout: { background: { color: "#0c1120" }, textColor: "#e6e9f0" },
     grid: { vertLines: { color: "#1c2333" }, horzLines: { color: "#1c2333" } },
     rightPriceScale: { borderColor: "#26314a" },
-    timeScale: { borderColor: "#26314a", timeVisible: true, secondsVisible: false },
+    // Correção Fase 3.6.1 (segunda causa raiz): shiftVisibleRangeOnNewBar
+    // é `true` por padrão no Lightweight Charts -- a biblioteca desloca
+    // sozinha a janela visível para frente sempre que um candle novo
+    // chega (mesmo via update(), nunca setData()), sempre que o range
+    // exibido ainda alcança onde estava o último candle no momento do
+    // pan. Isso "vazava" o modo exploração de volta para perto do tempo
+    // real a cada novo candle, mesmo já eliminado o setData() em loop
+    // (comprovado em navegador real: range mudava a cada poll mesmo com
+    // followLive=false e zero chamadas a setData()). O reancoramento ao
+    // vivo já é feito explicitamente pelo próprio app.js
+    // (applyChartWindow() quando followLive===true, em refreshChart()) --
+    // a biblioteca nunca precisa fazer isso por conta própria.
+    timeScale: {
+      borderColor: "#26314a", timeVisible: true, secondsVisible: false,
+      shiftVisibleRangeOnNewBar: false,
+    },
     autoSize: true,
   });
   const candleSeries = chart.addCandlestickSeries({
@@ -1102,30 +1117,132 @@ function sanitizeCandles(rawCandles) {
   return Array.from(byTime.values()).sort((a, b) => a.time - b.time);
 }
 
-// Decide entre update() incremental (candle novo, ou o candle mais
-// recente mudou por ainda estar em formação) e setData() completo
-// (primeira carga, troca de símbolo, ou qualquer divergência estrutural
-// no histórico anterior que não seja só "o topo mudou").
-function applyCandlesToSeries(series, mapFn, prevCandles, nextCandles) {
+// Compara dois pontos de dados IGNORANDO `time` -- funciona tanto para
+// candles (open/high/low/close) quanto para volume ({value, color}) e
+// médias ({value}), os três formatos que passam por applyCandlesToSeries.
+function sameDataPoint(a, b) {
+  const keys = new Set([...Object.keys(a), ...Object.keys(b)]);
+  keys.delete("time");
+  for (const k of keys) {
+    if (a[k] !== b[k]) return false;
+  }
+  return true;
+}
+
+// Função PURA (nunca toca o Lightweight Charts) que decide como aplicar
+// `nextMapped` sobre uma série que já tem `prevMapped` desenhado.
+// Devolve `{ reset: false, updates: [...] }` (update() incremental,
+// nunca move o viewport) ou `{ reset: true, reason: "..." }` (setData()
+// necessário).
+//
+// Correção Fase 3.6.1, rodada 1 (causa raiz do pan não persistir): a
+// rota /api/chart-data devolve uma JANELA DESLIZANTE limitada a `limit`
+// candles. Assim que o histórico total ultrapassa esse limite -- o caso
+// normal depois de a V2 rodar por mais de ~25h contínuas -- cada
+// atualização derruba o candle mais antigo da janela. Comparar por
+// POSIÇÃO/ÍNDICE (versão anterior) falhava em todo ciclo assim que isso
+// acontecia, forçando setData() continuamente (comprovado em navegador
+// real: 9 chamadas a setData() em 9s, 0 a update()) -- e setData() no
+// Lightweight Charts real preserva a posição LÓGICA a partir da borda
+// direita, não o intervalo de tempo visível, arrastando a janela visível
+// para frente mesmo com o usuário explorando o histórico.
+//
+// Correção Fase 3.6.1, rodada 2 (endurecimento): "há alguma sobreposição"
+// sozinho é permissivo demais -- não distinguia um deslizamento normal
+// de uma DIVERGÊNCIA ESTRUTURAL real (lacuna no meio, candle histórico
+// removido, OHLCV histórico reescrito, timestamp duplicado ou fora de
+// ordem). Um deslizamento normal preserva, para cada candle de
+// `prevMapped` que ainda cabe na janela nova, o mesmo tempo E o mesmo
+// OHLCV (exceto o último, que pode estar em formação) -- qualquer
+// violação disso é tratada como divergência estrutural (setData(),
+// nunca update() com dado incoerente na tela).
+function classifyCandlesUpdate(prevMapped, nextMapped) {
+  if (prevMapped.length === 0) return { reset: true, reason: "primeira carga" };
+  if (nextMapped.length === 0) return { reset: false, updates: [] };
+
+  for (let i = 1; i < nextMapped.length; i++) {
+    if (nextMapped[i].time === nextMapped[i - 1].time) {
+      return { reset: true, reason: `timestamp duplicado na resposta (time=${nextMapped[i].time})` };
+    }
+    if (nextMapped[i].time < nextMapped[i - 1].time) {
+      return { reset: true, reason: `timestamps fora de ordem na resposta (time=${nextMapped[i].time})` };
+    }
+  }
+
+  const prevMaxTime = prevMapped[prevMapped.length - 1].time;
+  const nextMinTime = nextMapped[0].time;
+  const nextMaxTime = nextMapped[nextMapped.length - 1].time;
+  if (nextMinTime > prevMaxTime) {
+    return { reset: true, reason: "lacuna sem nenhuma sobreposição com o que já estava desenhado" };
+  }
+
+  // Todo candle de `prevMapped` que ainda deveria caber na janela nova
+  // (não "caiu" pela frente por deslizamento normal) precisa continuar
+  // presente, com o mesmo OHLCV -- exceto o próprio último candle
+  // conhecido, que pode estar em formação.
+  const nextByTime = new Map(nextMapped.map((c) => [c.time, c]));
+  const stillExpected = prevMapped.filter((p) => p.time >= nextMinTime && p.time <= nextMaxTime);
+  for (const p of stillExpected) {
+    const n = nextByTime.get(p.time);
+    if (!n) return { reset: true, reason: `candle histórico removido da janela (time=${p.time})` };
+    if (p.time !== prevMaxTime && !sameDataPoint(p, n)) {
+      return { reset: true, reason: `OHLCV histórico alterado (time=${p.time})` };
+    }
+  }
+
+  // Todo candle de `nextMapped` dentro do intervalo que `prevMapped` já
+  // cobria precisa já existir em `prevMapped` -- senão é um candle
+  // inserido no meio de uma série já conhecida (lacuna estrutural
+  // interna), não um deslizamento pela borda.
+  const prevByTime = new Map(prevMapped.map((c) => [c.time, c]));
+  const prevMinTime = prevMapped[0].time;
+  for (const n of nextMapped) {
+    if (n.time < prevMinTime || n.time > prevMaxTime) continue;
+    if (!prevByTime.has(n.time)) {
+      return { reset: true, reason: `candle novo inserido no meio da série já conhecida (time=${n.time})` };
+    }
+  }
+
+  return { reset: false, updates: nextMapped.filter((n) => n.time >= prevMaxTime) };
+}
+
+// Aplica o plano de `classifyCandlesUpdate()` -- só esta função toca o
+// Lightweight Charts. Quando um reset é necessário e o usuário está
+// explorando o histórico (`followLive === false`), o intervalo de tempo
+// visível é capturado ANTES do setData() e restaurado exatamente depois
+// -- setData() nunca pode ser a causa de perder a posição do pan, mesmo
+// quando é genuinamente necessário (divergência estrutural real). Em
+// modo ao vivo, nada é restaurado aqui: o próprio refreshChart() já
+// reancora a visão ao vivo logo em seguida, normalmente.
+function resetSeriesPreservingView(series, chart, nextMapped) {
+  let savedRange = null;
+  if (chart && CHART_STATE.followLive === false) {
+    try {
+      savedRange = chart.timeScale().getVisibleRange();
+    } catch (err) {
+      savedRange = null;
+    }
+  }
+  series.setData(nextMapped);
+  if (savedRange) {
+    try {
+      chart.timeScale().setVisibleRange(savedRange);
+    } catch (err) {
+      // Melhor esforço -- uma falha aqui nunca pode interromper o resto
+      // de refreshChart() (mesmo padrão já usado em saveCurrentSymbolViewState()).
+    }
+  }
+}
+
+function applyCandlesToSeries(series, mapFn, prevCandles, nextCandles, chart) {
   const prevMapped = prevCandles.map(mapFn);
   const nextMapped = nextCandles.map(mapFn);
-  if (prevMapped.length === 0 || nextMapped.length < prevMapped.length - 1) {
-    series.setData(nextMapped);
+  const plan = classifyCandlesUpdate(prevMapped, nextMapped);
+  if (plan.reset) {
+    resetSeriesPreservingView(series, chart, nextMapped);
     return;
   }
-  const overlapLen = Math.min(prevMapped.length, nextMapped.length) - 1;
-  let sameBase = true;
-  for (let i = 0; i < overlapLen; i++) {
-    if (prevMapped[i].time !== nextMapped[i].time) { sameBase = false; break; }
-  }
-  if (!sameBase) {
-    series.setData(nextMapped);
-    return;
-  }
-  // Base idêntica -- só o(s) ponto(s) no topo mudou(aram)/foi(ram)
-  // adicionado(s). update() nunca move o viewport, ao contrário de
-  // setData().
-  for (let i = overlapLen; i < nextMapped.length; i++) series.update(nextMapped[i]);
+  plan.updates.forEach((point) => series.update(point));
 }
 
 async function refreshChartSymbolOptions() {
@@ -1225,10 +1342,10 @@ async function refreshChart() {
     const prevCandles = CHART_STATE.lastCandles;
     applyCandlesToSeries(CHART_STATE.candleSeries,
       (c) => ({ time: c.time, open: c.open, high: c.high, low: c.low, close: c.close }),
-      prevCandles, candles);
+      prevCandles, candles, CHART_STATE.chart);
     applyCandlesToSeries(CHART_STATE.volumeSeries,
       (c) => ({ time: c.time, value: c.volume, color: c.close >= c.open ? CHART_UP_COLOR : CHART_DOWN_COLOR }),
-      prevCandles, candles);
+      prevCandles, candles, CHART_STATE.chart);
     CHART_STATE.lastCandles = candles;
 
     const cfg = body.strategy_config || { fast_period: 9, slow_period: 21 };
@@ -1243,8 +1360,8 @@ async function refreshChart() {
     const prevSmaFast = CHART_STATE.lastSmaSource || [];
     const nextSmaFast = computeSMA(smaSource, cfg.fast_period);
     const nextSmaSlow = computeSMA(smaSource, cfg.slow_period);
-    applyCandlesToSeries(CHART_STATE.smaFastSeries, (p) => p, CHART_STATE.lastSmaFast || [], nextSmaFast);
-    applyCandlesToSeries(CHART_STATE.smaSlowSeries, (p) => p, CHART_STATE.lastSmaSlow || [], nextSmaSlow);
+    applyCandlesToSeries(CHART_STATE.smaFastSeries, (p) => p, CHART_STATE.lastSmaFast || [], nextSmaFast, CHART_STATE.chart);
+    applyCandlesToSeries(CHART_STATE.smaSlowSeries, (p) => p, CHART_STATE.lastSmaSlow || [], nextSmaSlow, CHART_STATE.chart);
     CHART_STATE.lastSmaFast = nextSmaFast;
     CHART_STATE.lastSmaSlow = nextSmaSlow;
 
